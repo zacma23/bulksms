@@ -1,0 +1,541 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated ZACMA SMS Portal user profile with role and permissions.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "Verified user email address."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Display name of the portal user."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "staff"],
+          "description": "Assigned RBAC role."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended"],
+          "description": "Account access status."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of profile creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": ["uid", "email", "displayName", "role", "status", "createdAt", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted registry document granting administrator privileges.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "grantedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "grantedBy", "createdAt"]
+    },
+    "StaffAccount": {
+      "title": "StaffAccount",
+      "description": "Admin-created staff account authorization and granular permissions.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "staff"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended"]
+        },
+        "canSendBulk": {
+          "type": "boolean"
+        },
+        "canManageContacts": {
+          "type": "boolean"
+        },
+        "canManageCampaigns": {
+          "type": "boolean"
+        },
+        "canViewReports": {
+          "type": "boolean"
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "email",
+        "fullName",
+        "role",
+        "status",
+        "canSendBulk",
+        "canManageContacts",
+        "canManageCampaigns",
+        "canViewReports",
+        "orgId",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ContactGroup": {
+      "title": "ContactGroup",
+      "description": "Named group for organizing customer contacts.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "description", "orgId", "createdBy", "createdAt", "updatedAt"]
+    },
+    "Contact": {
+      "title": "Contact",
+      "description": "Customer contact record with validated E.164 phone number.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "phone": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 20,
+          "pattern": "^\\+[1-9][0-9]{6,14}$"
+        },
+        "groupIds": {
+          "type": "array",
+          "description": "Up to 20 group IDs this contact belongs to."
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "phone", "groupIds", "notes", "orgId", "createdBy", "createdAt", "updatedAt"]
+    },
+    "Campaign": {
+      "title": "Campaign",
+      "description": "Bulk SMS campaign record including schedule, counts, and delivery status.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "messageTemplate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1600
+        },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15
+        },
+        "groupIds": {
+          "type": "array",
+          "description": "Up to 20 target group IDs."
+        },
+        "recipientCount": {
+          "type": "number"
+        },
+        "sentCount": {
+          "type": "number"
+        },
+        "deliveredCount": {
+          "type": "number"
+        },
+        "failedCount": {
+          "type": "number"
+        },
+        "pendingCount": {
+          "type": "number"
+        },
+        "estimatedSegments": {
+          "type": "number"
+        },
+        "estimatedCost": {
+          "type": "number"
+        },
+        "actualCost": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string",
+          "maxLength": 12
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "scheduled", "sending", "paused", "completed", "cancelled", "failed"]
+        },
+        "scheduledAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByEmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "name",
+        "messageTemplate",
+        "senderId",
+        "groupIds",
+        "recipientCount",
+        "sentCount",
+        "deliveredCount",
+        "failedCount",
+        "pendingCount",
+        "estimatedSegments",
+        "estimatedCost",
+        "actualCost",
+        "currency",
+        "status",
+        "scheduledAt",
+        "orgId",
+        "createdBy",
+        "createdByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SmsTransaction": {
+      "title": "SmsTransaction",
+      "description": "Individual SMS dispatch transaction log with provider response and delivery status.",
+      "type": "object",
+      "properties": {
+        "campaignId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "campaignName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 140
+        },
+        "recipientName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "recipientPhone": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 20,
+          "pattern": "^\\+[1-9][0-9]{6,14}$"
+        },
+        "messageContent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1600
+        },
+        "senderId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15
+        },
+        "segments": {
+          "type": "number"
+        },
+        "cost": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string",
+          "maxLength": 12
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "sent", "delivered", "failed", "rejected"]
+        },
+        "providerMessageId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "apiResponseSummary": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "httpStatus": {
+          "type": "number"
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        },
+        "retryCount": {
+          "type": "number"
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByEmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "campaignId",
+        "campaignName",
+        "recipientName",
+        "recipientPhone",
+        "messageContent",
+        "senderId",
+        "segments",
+        "cost",
+        "currency",
+        "status",
+        "providerMessageId",
+        "apiResponseSummary",
+        "httpStatus",
+        "idempotencyKey",
+        "retryCount",
+        "orgId",
+        "createdBy",
+        "createdByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable audit trail for SMS sending, campaign changes, contact imports, and RBAC events.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "actorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "actorEmail": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "actorRole": {
+          "type": "string",
+          "enum": ["admin", "staff"]
+        },
+        "targetType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "targetId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["action", "actorUid", "actorEmail", "actorRole", "targetType", "targetId", "summary", "orgId", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Authenticated portal user profiles (PII isolated to owner or admin)."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Trusted administrator role registry."
+    },
+    "/staff_accounts/{staffId}": {
+      "schema": { "$ref": "#/entities/StaffAccount" },
+      "description": "Admin-managed staff accounts and granular portal permissions."
+    },
+    "/contact_groups/{groupId}": {
+      "schema": { "$ref": "#/entities/ContactGroup" },
+      "description": "Customer contact groups for targeted bulk SMS."
+    },
+    "/contacts/{contactId}": {
+      "schema": { "$ref": "#/entities/Contact" },
+      "description": "Customer contacts with international E.164 phone numbers."
+    },
+    "/campaigns/{campaignId}": {
+      "schema": { "$ref": "#/entities/Campaign" },
+      "description": "Bulk SMS campaigns, schedules, and aggregate delivery counters."
+    },
+    "/sms_transactions/{txId}": {
+      "schema": { "$ref": "#/entities/SmsTransaction" },
+      "description": "Per-recipient SMS transaction logs, API responses, and delivery status."
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only audit trail of all SMS and administrative activities."
+    }
+  }
+}

@@ -1,0 +1,488 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Global Hardened Primitives
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isBootstrapAdmin() {
+      return isSignedIn() && request.auth.token.email == 'zekimuluken@gmail.com';
+    }
+
+    function currentEmailKey() {
+      return request.auth.token.email.lower().replace('[^a-z0-9]', '_');
+    }
+
+    function isAdmin() {
+      return isBootstrapAdmin()
+        || (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function hasActiveStaffAccount() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/staff_accounts/$(currentEmailKey()))
+        && get(/databases/$(database)/documents/staff_accounts/$(currentEmailKey())).data.status == 'active';
+    }
+
+    function isAuthorizedMember() {
+      return isAdmin() || hasActiveStaffAccount();
+    }
+
+    function staffCanManageContacts() {
+      return isAdmin() || (
+        hasActiveStaffAccount()
+        && get(/databases/$(database)/documents/staff_accounts/$(currentEmailKey())).data.canManageContacts == true
+      );
+    }
+
+    function staffCanManageCampaigns() {
+      return isAdmin() || (
+        hasActiveStaffAccount()
+        && get(/databases/$(database)/documents/staff_accounts/$(currentEmailKey())).data.canManageCampaigns == true
+      );
+    }
+
+    function staffCanSendBulk() {
+      return isAdmin() || (
+        hasActiveStaffAccount()
+        && get(/databases/$(database)/documents/staff_accounts/$(currentEmailKey())).data.canSendBulk == true
+      );
+    }
+
+    function isValidEmail(val) {
+      return val is string && val.size() >= 3 && val.size() <= 254;
+    }
+
+    function isValidPhone(val) {
+      return val is string && val.size() >= 8 && val.size() <= 20 && val.matches('^\\+[1-9][0-9]{6,14}$');
+    }
+
+    function isValidGroupIds(listVal) {
+      return listVal is list
+        && listVal.size() <= 20
+        && (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() >= 1 && listVal[0].size() <= 128));
+    }
+
+    // =========================================================================
+    // Entity Validation Blueprints (Anti-Update-Gap)
+    // =========================================================================
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isValidEmail(data.email)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role in ['admin', 'staff']
+        && data.status in ['active', 'suspended']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'email', 'grantedBy', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'grantedBy', 'createdAt'])
+        && isValidId(data.uid)
+        && isValidEmail(data.email)
+        && isValidId(data.grantedBy)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStaffAccount(data) {
+      return data.keys().hasAll([
+          'email', 'fullName', 'role', 'status',
+          'canSendBulk', 'canManageContacts', 'canManageCampaigns', 'canViewReports',
+          'orgId', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'email', 'fullName', 'role', 'status',
+          'canSendBulk', 'canManageContacts', 'canManageCampaigns', 'canViewReports',
+          'orgId', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidEmail(data.email)
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.role in ['admin', 'staff']
+        && data.status in ['active', 'suspended']
+        && data.canSendBulk is bool
+        && data.canManageContacts is bool
+        && data.canManageCampaigns is bool
+        && data.canViewReports is bool
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidContactGroup(data) {
+      return data.keys().hasAll(['name', 'description', 'orgId', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'description', 'orgId', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.description is string && data.description.size() <= 300
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidContact(data) {
+      return data.keys().hasAll(['name', 'phone', 'groupIds', 'notes', 'orgId', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'phone', 'groupIds', 'notes', 'orgId', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && isValidPhone(data.phone)
+        && isValidGroupIds(data.groupIds)
+        && data.notes is string && data.notes.size() <= 300
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCampaign(data) {
+      return data.keys().hasAll([
+          'name', 'messageTemplate', 'senderId', 'groupIds',
+          'recipientCount', 'sentCount', 'deliveredCount', 'failedCount', 'pendingCount',
+          'estimatedSegments', 'estimatedCost', 'actualCost', 'currency',
+          'status', 'scheduledAt', 'orgId', 'createdBy', 'createdByEmail',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'name', 'messageTemplate', 'senderId', 'groupIds',
+          'recipientCount', 'sentCount', 'deliveredCount', 'failedCount', 'pendingCount',
+          'estimatedSegments', 'estimatedCost', 'actualCost', 'currency',
+          'status', 'scheduledAt', 'orgId', 'createdBy', 'createdByEmail',
+          'createdAt', 'updatedAt'
+        ])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 140
+        && data.messageTemplate is string && data.messageTemplate.size() >= 1 && data.messageTemplate.size() <= 1600
+        && data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 15
+        && isValidGroupIds(data.groupIds)
+        && data.recipientCount is number && data.recipientCount >= 0 && data.recipientCount <= 100000
+        && data.sentCount is number && data.sentCount >= 0 && data.sentCount <= 100000
+        && data.deliveredCount is number && data.deliveredCount >= 0 && data.deliveredCount <= 100000
+        && data.failedCount is number && data.failedCount >= 0 && data.failedCount <= 100000
+        && data.pendingCount is number && data.pendingCount >= 0 && data.pendingCount <= 100000
+        && data.estimatedSegments is number && data.estimatedSegments >= 0 && data.estimatedSegments <= 1000000
+        && data.estimatedCost is number && data.estimatedCost >= 0
+        && data.actualCost is number && data.actualCost >= 0
+        && data.currency is string && data.currency.size() <= 12
+        && data.status in ['draft', 'scheduled', 'sending', 'paused', 'completed', 'cancelled', 'failed']
+        && data.scheduledAt is string && data.scheduledAt.size() <= 40
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && isValidEmail(data.createdByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSmsTransaction(data) {
+      return data.keys().hasAll([
+          'campaignId', 'campaignName', 'recipientName', 'recipientPhone',
+          'messageContent', 'senderId', 'segments', 'cost', 'currency',
+          'status', 'providerMessageId', 'apiResponseSummary', 'httpStatus',
+          'idempotencyKey', 'retryCount', 'orgId', 'createdBy', 'createdByEmail',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'campaignId', 'campaignName', 'recipientName', 'recipientPhone',
+          'messageContent', 'senderId', 'segments', 'cost', 'currency',
+          'status', 'providerMessageId', 'apiResponseSummary', 'httpStatus',
+          'idempotencyKey', 'retryCount', 'orgId', 'createdBy', 'createdByEmail',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.campaignId)
+        && data.campaignName is string && data.campaignName.size() >= 1 && data.campaignName.size() <= 140
+        && data.recipientName is string && data.recipientName.size() <= 120
+        && isValidPhone(data.recipientPhone)
+        && data.messageContent is string && data.messageContent.size() >= 1 && data.messageContent.size() <= 1600
+        && data.senderId is string && data.senderId.size() >= 1 && data.senderId.size() <= 15
+        && data.segments is number && data.segments >= 1 && data.segments <= 20
+        && data.cost is number && data.cost >= 0
+        && data.currency is string && data.currency.size() <= 12
+        && data.status in ['pending', 'sent', 'delivered', 'failed', 'rejected']
+        && data.providerMessageId is string && data.providerMessageId.size() <= 128
+        && data.apiResponseSummary is string && data.apiResponseSummary.size() <= 1000
+        && data.httpStatus is number && data.httpStatus >= 0 && data.httpStatus <= 599
+        && data.idempotencyKey is string && data.idempotencyKey.size() >= 8 && data.idempotencyKey.size() <= 128
+        && data.retryCount is number && data.retryCount >= 0 && data.retryCount <= 10
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && isValidEmail(data.createdByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll([
+          'action', 'actorUid', 'actorEmail', 'actorRole',
+          'targetType', 'targetId', 'summary', 'orgId', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'action', 'actorUid', 'actorEmail', 'actorRole',
+          'targetType', 'targetId', 'summary', 'orgId', 'createdAt'
+        ])
+        && data.action is string && data.action.size() >= 1 && data.action.size() <= 80
+        && isValidId(data.actorUid)
+        && isValidEmail(data.actorEmail)
+        && data.actorRole in ['admin', 'staff']
+        && data.targetType is string && data.targetType.size() >= 1 && data.targetType.size() <= 60
+        && data.targetId is string && data.targetId.size() <= 128
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 500
+        && data.orgId == 'zacma'
+        && data.createdAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection Match Blocks
+    // =========================================================================
+
+    // Users (PII isolated to owner or admin)
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin() || (isSignedIn() && existing().uid == request.auth.uid);
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == userId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isOwner(userId)
+            && incoming().email == request.auth.token.email
+            && incoming().role == 'staff'
+            && incoming().status == 'active'
+            && hasActiveStaffAccount()
+          )
+        );
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && isValidUserProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isOwner(userId)
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(userId) && isAdmin();
+    }
+
+    // Admin registry
+    match /admins/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && isValidAdminRecord(incoming())
+        && incoming().uid == userId
+        && incoming().grantedBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && isAdmin();
+      allow update: if false;
+      allow delete: if isSignedIn() && isValidId(userId) && isBootstrapAdmin() && userId != request.auth.uid;
+    }
+
+    // Admin-created staff accounts
+    match /staff_accounts/{staffId} {
+      allow get: if isSignedIn() && isValidId(staffId) && (staffId == currentEmailKey() || isAdmin());
+      allow list: if isAdmin() || (isSignedIn() && existing().email == request.auth.token.email);
+      allow create: if isSignedIn()
+        && isValidId(staffId)
+        && isValidStaffAccount(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAdmin();
+      allow update: if isSignedIn()
+        && isValidId(staffId)
+        && isValidStaffAccount(incoming())
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'fullName', 'role', 'status',
+          'canSendBulk', 'canManageContacts', 'canManageCampaigns', 'canViewReports',
+          'updatedAt'
+        ])
+        && isAdmin();
+      allow delete: if isSignedIn() && isValidId(staffId) && isAdmin();
+    }
+
+    // Contact Groups
+    match /contact_groups/{groupId} {
+      allow get: if isSignedIn() && isValidId(groupId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(groupId)
+        && isValidContactGroup(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && staffCanManageContacts();
+      allow update: if isSignedIn()
+        && isValidId(groupId)
+        && isValidContactGroup(incoming())
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            staffCanManageContacts()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(groupId) && staffCanManageContacts();
+    }
+
+    // Contacts
+    match /contacts/{contactId} {
+      allow get: if isSignedIn() && isValidId(contactId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(contactId)
+        && isValidContact(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && staffCanManageContacts();
+      allow update: if isSignedIn()
+        && isValidId(contactId)
+        && isValidContact(incoming())
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            staffCanManageContacts()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'groupIds', 'notes', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(contactId) && staffCanManageContacts();
+    }
+
+    // Campaigns
+    match /campaigns/{campaignId} {
+      allow get: if isSignedIn() && isValidId(campaignId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(campaignId)
+        && isValidCampaign(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdByEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (staffCanManageCampaigns() || staffCanSendBulk());
+      allow update: if isSignedIn()
+        && isValidId(campaignId)
+        && isValidCampaign(incoming())
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdByEmail == existing().createdByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            (staffCanManageCampaigns() || staffCanSendBulk())
+            && !(existing().status in ['completed', 'cancelled'])
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'messageTemplate', 'senderId', 'groupIds',
+              'recipientCount', 'sentCount', 'deliveredCount', 'failedCount', 'pendingCount',
+              'estimatedSegments', 'estimatedCost', 'actualCost', 'currency',
+              'status', 'scheduledAt', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(campaignId) && isAdmin();
+    }
+
+    // SMS Transactions (enforces parent campaign existence)
+    match /sms_transactions/{txId} {
+      allow get: if isSignedIn() && isValidId(txId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(txId)
+        && isValidSmsTransaction(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdByEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && staffCanSendBulk()
+        && exists(/databases/$(database)/documents/campaigns/$(incoming().campaignId));
+      allow update: if isSignedIn()
+        && isValidId(txId)
+        && isValidSmsTransaction(incoming())
+        && incoming().campaignId == existing().campaignId
+        && incoming().recipientPhone == existing().recipientPhone
+        && incoming().idempotencyKey == existing().idempotencyKey
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdByEmail == existing().createdByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            staffCanSendBulk()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'providerMessageId', 'apiResponseSummary', 'httpStatus',
+              'cost', 'segments', 'retryCount', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if false;
+    }
+
+    // Immutable Audit Logs (actorRole verified against server state)
+    match /audit_logs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().actorUid == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(logId)
+        && isValidAuditLog(incoming())
+        && incoming().actorUid == request.auth.uid
+        && incoming().actorEmail == request.auth.token.email
+        && incoming().actorRole == (isAdmin() ? 'admin' : 'staff')
+        && incoming().createdAt == request.time
+        && isAuthorizedMember();
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // Connection test document (read-only ping)
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+  }
+}

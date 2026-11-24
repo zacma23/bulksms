@@ -1,0 +1,6 @@
+{
+  "name": "ZACMA SMS PORTAL",
+  "description": "Professional Bulk SMS Management Portal for ZACMA Technology powered by SMS.io API, Firebase Authentication, and Firestore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
