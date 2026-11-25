@@ -3,6 +3,8 @@ import {
   ResponsiveContainer,
   BarChart,
   Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -64,12 +66,49 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
     };
   }, [transactions]);
 
+  // 30-day SMS Sent vs. Failed trend data for the Recharts LineChart
+  const thirtyDayTrendData = useMemo(() => {
+    const now = new Date();
+    const days: { key: string; label: string; sent: number; failed: number }[] = [];
+
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(now.getDate() - i);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      days.push({ key, label, sent: 0, failed: 0 });
+    }
+
+    const dayMap = new Map(days.map((d) => [d.key, d]));
+
+    for (const tx of transactions) {
+      if (!tx.createdAt?.toDate) continue;
+      const d = tx.createdAt.toDate();
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const bucket = dayMap.get(key);
+      if (!bucket) continue;
+      if (tx.status === 'failed' || tx.status === 'rejected') {
+        bucket.failed += 1;
+      } else {
+        bucket.sent += 1;
+      }
+    }
+
+    return days;
+  }, [transactions]);
+
+  const thirtyDayTotals = useMemo(() => {
+    return thirtyDayTrendData.reduce(
+      (acc, d) => ({ sent: acc.sent + d.sent, failed: acc.failed + d.failed }),
+      { sent: 0, failed: 0 }
+    );
+  }, [thirtyDayTrendData]);
+
   const chartData = useMemo(() => {
     const now = new Date();
     const buckets: { key: string; label: string; successful: number; failed: number; pending: number }[] = [];
 
     if (period === 'daily') {
-      // Last 7 days
       for (let i = 6; i >= 0; i--) {
         const d = new Date(now);
         d.setDate(now.getDate() - i);
@@ -88,7 +127,6 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
         else b.pending += 1;
       }
     } else if (period === 'weekly') {
-      // Last 6 weeks
       for (let i = 5; i >= 0; i--) {
         const start = new Date(now);
         start.setDate(now.getDate() - i * 7 - 6);
@@ -111,7 +149,6 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
         }
       }
     } else {
-      // Last 6 months
       for (let i = 5; i >= 0; i--) {
         const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
         const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -275,7 +312,79 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
         </button>
       </section>
 
-      {/* Usage Chart & Reports */}
+      {/* 30-Day SMS Sent vs. Failed Line Chart */}
+      <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <h2 className="font-display text-base sm:text-lg font-bold text-slate-900">
+              SMS Sent vs. Failed — Last 30 Days
+            </h2>
+            <p className="text-xs text-slate-500">
+              Daily dispatch volume trend across all campaigns
+            </p>
+          </div>
+          <div className="flex items-center gap-3 text-xs font-mono tabular-nums text-slate-600">
+            <span className="text-blue-700 font-semibold">
+              {thirtyDayTotals.sent.toLocaleString()} sent
+            </span>
+            <span aria-hidden="true">·</span>
+            <span className="text-red-600 font-semibold">
+              {thirtyDayTotals.failed.toLocaleString()} failed
+            </span>
+          </div>
+        </div>
+
+        <div className="h-64 sm:h-72 w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={thirtyDayTrendData} margin={{ top: 8, right: 12, left: -16, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
+              <XAxis
+                dataKey="label"
+                interval={4}
+                tick={{ fontSize: 11, fill: '#64748B' }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <YAxis
+                allowDecimals={false}
+                tick={{ fontSize: 12, fill: '#64748B' }}
+                axisLine={false}
+                tickLine={false}
+              />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: '#0F172A',
+                  border: 'none',
+                  borderRadius: '12px',
+                  color: '#FFFFFF',
+                  fontSize: '12px',
+                }}
+              />
+              <Legend wrapperStyle={{ fontSize: '12px' }} />
+              <Line
+                type="monotone"
+                dataKey="sent"
+                name="SMS Sent"
+                stroke="#1D4ED8"
+                strokeWidth={2.5}
+                dot={{ r: 2.5, fill: '#1D4ED8' }}
+                activeDot={{ r: 5 }}
+              />
+              <Line
+                type="monotone"
+                dataKey="failed"
+                name="SMS Failed"
+                stroke="#DC2626"
+                strokeWidth={2.5}
+                dot={{ r: 2.5, fill: '#DC2626' }}
+                activeDot={{ r: 5 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </section>
+
+      {/* Usage Chart & Reports (Daily / Weekly / Monthly Breakdown) */}
       <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>

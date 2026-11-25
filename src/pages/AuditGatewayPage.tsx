@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
-import { RefreshCw, Search, ShieldCheck, Server } from 'lucide-react';
+import { RefreshCw, Search, ShieldCheck, Server, Globe } from 'lucide-react';
 import { usePortalData } from '../context/PortalDataContext';
+import { FIREBASE_AUTH_SETTINGS } from '../lib/firebase';
 import { formatTimestamp } from '../lib/smsUtils';
 
 export function AuditGatewayPage() {
@@ -90,8 +91,54 @@ export function AuditGatewayPage() {
           </div>
           <p className="font-mono text-[11px] text-slate-600">
             Send: POST /sms/send · Estimate: POST /sms/estimate · Balance: GET /api/balance ·
-            Status: GET /message/:id & GET /v2/messages · DLR Webhook: POST /api/sms/webhook
+            Status: GET /message/:id &amp; GET /v2/messages · DLR Webhook: POST /api/sms/webhook
           </p>
+        </div>
+      </section>
+
+      {/* Firebase Authentication & Authorized Domains Diagnostics */}
+      <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+            <Globe className="w-5 h-5" />
+          </div>
+          <div>
+            <h2 className="font-display text-base font-bold text-slate-900">
+              Firebase Authentication &amp; Authorized Domains
+            </h2>
+            <p className="text-xs text-slate-500">
+              Ensure your Vercel production, preview, and custom domains are listed in Firebase
+              Console → Authentication → Settings → Authorized domains
+            </p>
+          </div>
+        </div>
+
+        <dl className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2 border-t border-slate-100 text-xs">
+          <div>
+            <dt className="text-slate-500">Firebase Project ID</dt>
+            <dd className="font-mono font-semibold text-slate-900 mt-1">
+              {FIREBASE_AUTH_SETTINGS.projectId}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-slate-500">Configured Auth Domain</dt>
+            <dd className="font-mono font-semibold text-slate-900 mt-1 break-all">
+              {FIREBASE_AUTH_SETTINGS.authDomain}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-slate-500">Current Hosting Domain</dt>
+            <dd className="font-mono font-semibold text-blue-700 mt-1 break-all">
+              {FIREBASE_AUTH_SETTINGS.currentHostname}
+            </dd>
+          </div>
+        </dl>
+
+        <div className="text-xs text-slate-600">
+          <span className="font-semibold text-slate-800">Tracked Authorized Domains: </span>
+          <span className="font-mono text-[11px] break-all">
+            {FIREBASE_AUTH_SETTINGS.authorizedDomains.join(' · ')}
+          </span>
         </div>
       </section>
 

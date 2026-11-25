@@ -1,4 +1,5 @@
-import * as XLSX from 'xlsx';
+import { readSheet } from 'read-excel-file/browser';
+import writeXlsxFile, { type SheetData } from 'write-excel-file/browser';
 
 export const E164_PHONE_REGEX = /^\+[1-9][0-9]{6,14}$/;
 
@@ -70,26 +71,17 @@ export function analyzeSmsMessage(message: string): SmsSegmentMetrics {
 
 /**
  * Normalizes Ethiopian (+251) and international phone numbers to strict E.164 format.
- * Examples:
- * - 0911 22 33 44 -> +251911223344
- * - 0712-345-678 -> +251712345678
- * - 251911223344 -> +251911223344
- * - 00251911223344 -> +251911223344
- * - +1 (415) 555-0199 -> +14155550199
  */
 export function normalizePhoneNumber(rawInput: string, defaultEthiopia = true): string {
   let cleaned = String(rawInput || '').trim();
   if (!cleaned) return '';
 
-  // Remove spaces, dashes, dots, parentheses
   cleaned = cleaned.replace(/[\s\-().]/g, '');
 
-  // Convert 00 international prefix to +
   if (cleaned.startsWith('00')) {
     cleaned = `+${cleaned.slice(2)}`;
   }
 
-  // Handle Ethiopian local format (09XXXXXXXX or 07XXXXXXXX or 9XXXXXXXX / 7XXXXXXXX)
   if (defaultEthiopia && !cleaned.startsWith('+')) {
     if (/^0[79]\d{8}$/.test(cleaned)) {
       cleaned = `+251${cleaned.slice(1)}`;
@@ -148,60 +140,133 @@ export interface ParsedImportContact {
   rawPhone: string;
 }
 
-export async function parseContactsSpreadsheet(
-  file: File,
-  defaultEthiopia = true
-): Promise<ParsedImportContact[]> {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array', raw: false });
-  const firstSheet = workbook.SheetNames[0];
-  if (!firstSheet) return [];
+function parseCsvText(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let inQuotes = false;
 
-  const sheet = workbook.Sheets[firstSheet];
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
-    defval: '',
-    raw: false,
-  });
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+
+    if (inQuotes) {
+      if (ch === '"' && next === '"') {
+        cell += '"';
+        i += 1;
+      } else if (ch === '"') {
+        inQuotes = false;
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',' || ch === ';') {
+      row.push(cell.trim());
+      cell = '';
+    } else if (ch === '\r' && next === '\n') {
+      row.push(cell.trim());
+      rows.push(row);
+      row = [];
+      cell = '';
+      i += 1;
+    } else if (ch === '\n' || ch === '\r') {
+      row.push(cell.trim());
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else {
+      cell += ch;
+    }
+  }
+
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell.trim());
+    rows.push(row);
+  }
+
+  return rows.filter((r) => r.some((v) => v.length > 0));
+}
+
+function extractContactsFromMatrix(
+  matrix: string[][],
+  defaultEthiopia: boolean
+): ParsedImportContact[] {
+  if (matrix.length === 0) return [];
+
+  const firstRow = matrix[0].map((c) => c.trim().toLowerCase());
+  const hasHeader = firstRow.some((h) =>
+    /(name|phone|mobile|tel|number|msisdn|contact|customer|note)/.test(h)
+  );
+
+  const headers = hasHeader ? firstRow : [];
+  const dataRows = hasHeader ? matrix.slice(1) : matrix;
+
+  const findIndex = (patterns: RegExp[]): number => {
+    for (const p of patterns) {
+      const idx = headers.findIndex((h) => p.test(h));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  const phoneIdx = hasHeader
+    ? findIndex([/^phone/, /mobile/, /tel/, /number/, /msisdn/, /contact/])
+    : -1;
+  const nameIdx = hasHeader
+    ? findIndex([/^full.?name/, /^name/, /customer/, /client/, /first.?name/])
+    : -1;
+  const notesIdx = hasHeader ? findIndex([/note/, /remark/, /company/, /branch/, /city/]) : -1;
 
   const parsed: ParsedImportContact[] = [];
 
-  for (const row of rows) {
-    const keys = Object.keys(row);
-    const findCol = (patterns: RegExp[]): string => {
-      for (const p of patterns) {
-        const matchKey = keys.find((k) => p.test(k.trim().toLowerCase()));
-        if (matchKey !== undefined && String(row[matchKey] ?? '').trim() !== '') {
-          return String(row[matchKey]).trim();
-        }
-      }
-      return '';
-    };
-
+  for (const row of dataRows) {
     const rawPhone =
-      findCol([/^phone/, /mobile/, /tel/, /number/, /msisdn/, /contact/]) ||
-      // Fallback: pick first cell that looks like a phone number
-      Object.values(row)
-        .map((v) => String(v ?? '').trim())
-        .find((v) => /^[\d+\-() ]{8,20}$/.test(v)) ||
+      (phoneIdx >= 0 ? row[phoneIdx] : '') ||
+      row.find((v) => /^[\d+\-() ]{8,20}$/.test(v.trim())) ||
       '';
 
-    if (!rawPhone) continue;
+    if (!rawPhone.trim()) continue;
 
     const name =
-      findCol([/^full.?name/, /^name/, /customer/, /client/, /first.?name/]) || 'Customer';
-    const notes = findCol([/note/, /remark/, /company/, /branch/, /city/]).slice(0, 300);
+      (nameIdx >= 0 ? row[nameIdx] : '') ||
+      row.find(
+        (v, idx) => idx !== phoneIdx && v.trim().length > 0 && !/^[\d+\-() ]{8,20}$/.test(v.trim())
+      ) ||
+      'Customer';
+    const notes = (notesIdx >= 0 ? row[notesIdx] : '') || '';
 
     const normalized = normalizePhoneNumber(rawPhone, defaultEthiopia);
     parsed.push({
-      name: name.slice(0, 120),
+      name: name.trim().slice(0, 120) || 'Customer',
       phone: normalized,
-      notes,
+      notes: notes.trim().slice(0, 300),
       valid: isValidE164Phone(normalized),
-      rawPhone,
+      rawPhone: rawPhone.trim(),
     });
   }
 
   return parsed;
+}
+
+export async function parseContactsSpreadsheet(
+  file: File,
+  defaultEthiopia = true
+): Promise<ParsedImportContact[]> {
+  const lower = file.name.toLowerCase();
+  if (lower.endsWith('.csv') || file.type === 'text/csv') {
+    const text = await file.text();
+    const matrix = parseCsvText(text);
+    return extractContactsFromMatrix(matrix, defaultEthiopia);
+  }
+
+  if (lower.endsWith('.xlsx')) {
+    const rows = await readSheet(file);
+    const matrix = rows.map((row) => row.map((cell) => (cell == null ? '' : String(cell))));
+    return extractContactsFromMatrix(matrix, defaultEthiopia);
+  }
+
+  throw new Error('Unsupported file format. Please upload an Excel (.xlsx) or CSV (.csv) file.');
 }
 
 function neutralizeCsvFormula(val: string): string {
@@ -212,23 +277,29 @@ function neutralizeCsvFormula(val: string): string {
   return str;
 }
 
-export function exportRowsToExcel(
+export async function exportRowsToExcel(
   rows: Record<string, string | number>[],
   fileName: string,
   sheetName = 'Sheet1'
-): void {
-  const sanitized = rows.map((row) => {
-    const clean: Record<string, string | number> = {};
-    for (const [k, v] of Object.entries(row)) {
-      clean[k] = typeof v === 'string' ? neutralizeCsvFormula(v) : v;
-    }
-    return clean;
-  });
+): Promise<void> {
+  if (rows.length === 0) return;
+  const headers = Object.keys(rows[0]);
+  const data: SheetData = [
+    headers.map((h) => ({ type: String, value: h, fontWeight: 'bold' as const })),
+    ...rows.map((row) =>
+      headers.map((h) => {
+        const val = row[h] ?? '';
+        if (typeof val === 'number') {
+          return { type: Number, value: val };
+        }
+        return { type: String, value: neutralizeCsvFormula(String(val)) };
+      })
+    ),
+  ];
 
-  const ws = XLSX.utils.json_to_sheet(sanitized);
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, sheetName.slice(0, 31));
-  XLSX.writeFile(wb, fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`);
+  await writeXlsxFile(data, { sheet: sheetName.slice(0, 31) }).toFile(
+    fileName.endsWith('.xlsx') ? fileName : `${fileName}.xlsx`
+  );
 }
 
 export function exportRowsToCsv(

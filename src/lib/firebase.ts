@@ -1,5 +1,10 @@
 import { initializeApp } from 'firebase/app';
-import { GoogleAuthProvider, getAuth } from 'firebase/auth';
+import {
+  browserLocalPersistence,
+  GoogleAuthProvider,
+  getAuth,
+  setPersistence,
+} from 'firebase/auth';
 import {
   addDoc,
   collection,
@@ -11,14 +16,185 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 import type { UserRole } from '../types/portal';
 
-const app = initializeApp(firebaseConfig);
+const currentHostname =
+  typeof window !== 'undefined' && window.location?.hostname
+    ? window.location.hostname.toLowerCase()
+    : 'localhost';
+
+const envAuthDomain = (import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '').trim();
+const resolvedAuthDomain = envAuthDomain || firebaseConfig.authDomain;
+
+const extraEnvDomains = (import.meta.env.VITE_FIREBASE_AUTHORIZED_DOMAINS || '')
+  .split(',')
+  .map((d: string) => d.trim().toLowerCase())
+  .filter(Boolean);
+
+// Client-side domain registry tracking all expected hosting domains (localhost, Vercel, AI Studio, Firebase)
+// Note: Firebase enforces OAuth authorizedDomains server-side in Firebase Console -> Authentication -> Settings -> Authorized domains.
+export const FIREBASE_AUTH_SETTINGS = {
+  projectId: firebaseConfig.projectId,
+  authDomain: resolvedAuthDomain,
+  oAuthClientId: firebaseConfig.oAuthClientId,
+  currentHostname,
+  authorizedDomains: Array.from(
+    new Set([
+      'localhost',
+      '127.0.0.1',
+      firebaseConfig.authDomain,
+      `${firebaseConfig.projectId}.web.app`,
+      currentHostname,
+      ...extraEnvDomains,
+    ])
+  ),
+  consoleAuthorizedDomainsUrl: `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`,
+  consoleProvidersUrl: `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/providers`,
+};
+
+const appConfig = {
+  apiKey: firebaseConfig.apiKey,
+  authDomain: resolvedAuthDomain,
+  projectId: firebaseConfig.projectId,
+  storageBucket: firebaseConfig.storageBucket,
+  messagingSenderId: firebaseConfig.messagingSenderId,
+  appId: firebaseConfig.appId,
+  ...(firebaseConfig.measurementId ? { measurementId: firebaseConfig.measurementId } : {}),
+  authorizedDomains: FIREBASE_AUTH_SETTINGS.authorizedDomains,
+};
+
+const app = initializeApp(appConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
+
+// Keep users signed in across browser reloads and tab restarts
+void setPersistence(auth, browserLocalPersistence).catch((err) => {
+  console.warn('Could not enforce browserLocalPersistence:', err);
+});
+
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.addScope('email');
+googleProvider.addScope('profile');
 googleProvider.setCustomParameters({ prompt: 'select_account' });
 
 export const BOOTSTRAP_ADMIN_EMAIL = 'zekimuluken@gmail.com';
 export const ORG_ID = 'zacma' as const;
+
+export interface FormattedAuthError {
+  code: string;
+  message: string;
+  isUnauthorizedDomain: boolean;
+  isProviderDisabled: boolean;
+}
+
+export function formatFirebaseAuthError(error: unknown): FormattedAuthError {
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
+  const rawMessage = error instanceof Error ? error.message : String(error || '');
+
+  if (code === 'auth/unauthorized-domain' || rawMessage.includes('auth/unauthorized-domain')) {
+    return {
+      code: 'auth/unauthorized-domain',
+      message: `This domain (${FIREBASE_AUTH_SETTINGS.currentHostname}) is not whitelisted in Firebase Console yet. Add "${FIREBASE_AUTH_SETTINGS.currentHostname}" under Authentication → Settings → Authorized domains for project "${FIREBASE_AUTH_SETTINGS.projectId}", or sign in with Email & Password below.`,
+      isUnauthorizedDomain: true,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/operation-not-allowed') {
+    return {
+      code,
+      message:
+        'This sign-in method is not enabled yet in Firebase Console. Enable Email/Password under Authentication → Sign-in method.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: true,
+    };
+  }
+
+  if (code === 'auth/popup-blocked') {
+    return {
+      code,
+      message:
+        'Your browser blocked the Google sign-in popup. Allow popups for this site or sign in with Email & Password.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+    return {
+      code,
+      message: '',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (
+    code === 'auth/invalid-credential' ||
+    code === 'auth/wrong-password' ||
+    code === 'auth/user-not-found'
+  ) {
+    return {
+      code,
+      message: 'Invalid email or password. Double-check your credentials or reset your password.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/email-already-in-use') {
+    return {
+      code,
+      message: 'An account with this email already exists. Please sign in or reset your password.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/weak-password') {
+    return {
+      code,
+      message: 'Password is too weak. Use at least 6 characters with letters and numbers.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/invalid-email') {
+    return {
+      code,
+      message: 'Please enter a valid email address.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/too-many-requests') {
+    return {
+      code,
+      message: 'Too many sign-in attempts. Wait a minute and try again, or reset your password.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  if (code === 'auth/network-request-failed') {
+    return {
+      code,
+      message: 'Network error contacting Firebase Authentication. Check your internet connection.',
+      isUnauthorizedDomain: false,
+      isProviderDisabled: false,
+    };
+  }
+
+  return {
+    code: code || 'auth/unknown',
+    message: rawMessage || 'Authentication failed. Please try again.',
+    isUnauthorizedDomain: false,
+    isProviderDisabled: false,
+  };
+}
 
 export function emailToStaffDocId(email: string): string {
   return email
@@ -122,7 +298,6 @@ export async function recordAuditLog(params: {
       createdAt: serverTimestamp(),
     });
   } catch (error) {
-    // Log audit failures without breaking primary UI flow unless permission issue
     console.error('Audit log write failed:', error);
   }
 }

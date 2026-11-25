@@ -9,8 +9,28 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
+
+function resolveServerPort(): number {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) {
+      const parsed = Number(args[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    if (args[i].startsWith('--port=')) {
+      const parsed = Number(args[i].slice('--port='.length));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  if (IS_PROD && process.env.PORT) {
+    const parsed = Number(process.env.PORT);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 3000;
+}
+
+const PORT = resolveServerPort();
 const BOOTSTRAP_ADMIN_EMAIL = 'zekimuluken@gmail.com';
 
 // Load Firebase projectId and databaseId from provisioned config

@@ -1,28 +1,55 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut as firebaseSignOut, type User } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  sendEmailVerification,
+  sendPasswordResetEmail,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut as firebaseSignOut,
+  updateProfile,
+  type User,
+} from 'firebase/auth';
 import { doc, getDoc, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
 import {
   auth,
   BOOTSTRAP_ADMIN_EMAIL,
   db,
   emailToStaffDocId,
+  formatFirebaseAuthError,
   googleProvider,
   handleFirestoreError,
   OperationType,
   recordAuditLog,
+  type FormattedAuthError,
 } from '../lib/firebase';
 import type { StaffAccount, StaffPermissions, UserRole } from '../types/portal';
 
 export interface AuthState {
   firebaseUser: User | null;
   loading: boolean;
+  submitting: boolean;
   authorized: boolean;
-  authStatus: 'loading' | 'signed_out' | 'authorized' | 'unauthorized' | 'suspended';
+  authStatus:
+    | 'loading'
+    | 'signed_out'
+    | 'unverified_email'
+    | 'authorized'
+    | 'unauthorized'
+    | 'suspended';
   role: UserRole;
   displayName: string;
   permissions: StaffPermissions;
   error: string | null;
+  authError: FormattedAuthError | null;
+  notice: string | null;
+  clearFeedback: () => void;
   signInWithGoogle: () => Promise<void>;
+  signInWithEmail: (email: string, password: string) => Promise<void>;
+  registerWithEmail: (fullName: string, email: string, password: string) => Promise<void>;
+  sendPasswordReset: (email: string) => Promise<boolean>;
+  resendVerificationEmail: () => Promise<void>;
+  refreshVerificationStatus: () => Promise<void>;
   signOut: () => Promise<void>;
   recheckAccess: () => Promise<void>;
 }
@@ -46,11 +73,18 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthState['authStatus']>('loading');
   const [role, setRole] = useState<UserRole>('staff');
   const [displayName, setDisplayName] = useState('');
   const [permissions, setPermissions] = useState<StaffPermissions>(NO_PERMISSIONS);
-  const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<FormattedAuthError | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const clearFeedback = useCallback(() => {
+    setAuthError(null);
+    setNotice(null);
+  }, []);
 
   const resolveUserAccess = useCallback(async (user: User | null) => {
     if (!user) {
@@ -64,14 +98,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     setLoading(true);
-    setError(null);
     setFirebaseUser(user);
 
     const email = (user.email || '').trim().toLowerCase();
-    if (!email || !user.emailVerified) {
+    if (!email) {
       setAuthStatus('unauthorized');
       setPermissions(NO_PERMISSIONS);
-      setError('A verified Google email address is required to access ZACMA SMS PORTAL.');
+      setAuthError({
+        code: 'auth/missing-email',
+        message: 'Your account does not have an email address attached.',
+        isUnauthorizedDomain: false,
+        isProviderDisabled: false,
+      });
+      setLoading(false);
+      return;
+    }
+
+    if (!user.emailVerified) {
+      setAuthStatus('unverified_email');
+      setDisplayName((user.displayName || email.split('@')[0] || 'Portal User').slice(0, 120));
+      setPermissions(NO_PERMISSIONS);
       setLoading(false);
       return;
     }
@@ -84,7 +130,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       let isActive = isBootstrap;
       let isSuspended = false;
 
-      // Check admins/{uid} registry if not bootstrap admin
       if (!isAdmin) {
         try {
           const adminSnap = await getDoc(doc(db, 'admins', user.uid));
@@ -97,7 +142,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      // Check admin-created staff_accounts/{emailKey}
       const staffDocId = emailToStaffDocId(email);
       let staffData: Omit<StaffAccount, 'id'> | null = null;
       try {
@@ -150,7 +194,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const finalRole: UserRole = isAdmin ? 'admin' : 'staff';
 
-      // Ensure bootstrap admin or promoted staff-admin has /admins/{uid} doc if allowed
       if (isBootstrap) {
         try {
           const adminDocRef = doc(db, 'admins', user.uid);
@@ -168,7 +211,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      // Sync /users/{uid} profile
       const userDocRef = doc(db, 'users', user.uid);
       try {
         const existingUser = await getDoc(userDocRef);
@@ -189,7 +231,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           });
         }
       } catch (profileErr) {
-        // Surface rule issues only if unexpected
         console.warn('Profile sync notice:', profileErr);
       }
 
@@ -197,9 +238,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setDisplayName(resolvedName);
       setPermissions(isAdmin ? FULL_PERMISSIONS : resolvedPermissions);
       setAuthStatus('authorized');
+      setAuthError(null);
+      setNotice(null);
       setLoading(false);
 
-      // Record sign-in audit event
       void recordAuditLog({
         action: 'AUTH_LOGIN',
         actorUid: user.uid,
@@ -222,19 +264,137 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [resolveUserAccess]);
 
   const signInWithGoogle = useCallback(async () => {
-    setError(null);
+    setAuthError(null);
+    setNotice(null);
+    setSubmitting(true);
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Sign-in failed. Please try again.';
-      if (!msg.includes('popup-closed-by-user')) {
-        setError(msg);
+      const formatted = formatFirebaseAuthError(err);
+      if (formatted.message) {
+        setAuthError(formatted);
       }
+    } finally {
+      setSubmitting(false);
     }
   }, []);
 
+  const signInWithEmail = useCallback(async (email: string, password: string) => {
+    setAuthError(null);
+    setNotice(null);
+    setSubmitting(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+    } catch (err) {
+      const formatted = formatFirebaseAuthError(err);
+      if (formatted.message) {
+        setAuthError(formatted);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }, []);
+
+  const registerWithEmail = useCallback(
+    async (fullName: string, email: string, password: string) => {
+      setAuthError(null);
+      setNotice(null);
+      setSubmitting(true);
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        if (fullName.trim()) {
+          await updateProfile(cred.user, { displayName: fullName.trim().slice(0, 120) });
+        }
+        await sendEmailVerification(cred.user);
+        setNotice(
+          `Account created. A verification link was sent to ${email.trim()}. Verify your email, then click "I've Verified — Continue".`
+        );
+      } catch (err) {
+        const formatted = formatFirebaseAuthError(err);
+        if (formatted.message) {
+          setAuthError(formatted);
+        }
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    []
+  );
+
+  const sendPasswordReset = useCallback(async (email: string): Promise<boolean> => {
+    setAuthError(null);
+    setNotice(null);
+    const cleanEmail = email.trim();
+    if (!cleanEmail) {
+      setAuthError({
+        code: 'auth/invalid-email',
+        message: 'Enter your email address to receive a password reset link.',
+        isUnauthorizedDomain: false,
+        isProviderDisabled: false,
+      });
+      return false;
+    }
+    setSubmitting(true);
+    try {
+      await sendPasswordResetEmail(auth, cleanEmail);
+      setNotice(`Password reset instructions have been sent to ${cleanEmail}. Check your inbox.`);
+      return true;
+    } catch (err) {
+      const formatted = formatFirebaseAuthError(err);
+      if (formatted.message) {
+        setAuthError(formatted);
+      }
+      return false;
+    } finally {
+      setSubmitting(false);
+    }
+  }, []);
+
+  const resendVerificationEmail = useCallback(async () => {
+    setAuthError(null);
+    setNotice(null);
+    const user = auth.currentUser;
+    if (!user) return;
+    setSubmitting(true);
+    try {
+      await sendEmailVerification(user);
+      setNotice(`Verification link re-sent to ${user.email}. Check your inbox and spam folder.`);
+    } catch (err) {
+      const formatted = formatFirebaseAuthError(err);
+      if (formatted.message) {
+        setAuthError(formatted);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }, []);
+
+  const refreshVerificationStatus = useCallback(async () => {
+    setAuthError(null);
+    setNotice(null);
+    const user = auth.currentUser;
+    if (!user) return;
+    setSubmitting(true);
+    try {
+      await user.reload();
+      await user.getIdToken(true);
+      if (!auth.currentUser?.emailVerified) {
+        setNotice('Email is not verified yet. Open the verification link in your inbox, then click again.');
+      }
+      await resolveUserAccess(auth.currentUser);
+    } catch (err) {
+      const formatted = formatFirebaseAuthError(err);
+      if (formatted.message) {
+        setAuthError(formatted);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }, [resolveUserAccess]);
+
   const signOut = useCallback(async () => {
-    setError(null);
+    setAuthError(null);
+    setNotice(null);
     await firebaseSignOut(auth);
   }, []);
 
@@ -247,13 +407,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       value={{
         firebaseUser,
         loading,
+        submitting,
         authorized: authStatus === 'authorized',
         authStatus,
         role,
         displayName,
         permissions,
-        error,
+        error: authError?.message || null,
+        authError,
+        notice,
+        clearFeedback,
         signInWithGoogle,
+        signInWithEmail,
+        registerWithEmail,
+        sendPasswordReset,
+        resendVerificationEmail,
+        refreshVerificationStatus,
         signOut,
         recheckAccess,
       }}
