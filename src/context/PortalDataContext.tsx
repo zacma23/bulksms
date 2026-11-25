@@ -20,8 +20,8 @@ import {
 import {
   dispatchSingleSms,
   fetchDeliveryStatuses,
-  fetchGatewayBalance,
-  fetchGatewayConfigStatus,
+  fetchSimBridgeStatus,
+  normalizeDeliveryStatus,
 } from '../lib/api';
 import {
   analyzeSmsMessage,
@@ -34,9 +34,9 @@ import type {
   Campaign,
   Contact,
   ContactGroup,
-  GatewayBalance,
-  GatewayConfigStatus,
   RecipientItem,
+  SimBridgeStatus,
+  SimSlotPreference,
   SmsTransaction,
   StaffAccount,
 } from '../types/portal';
@@ -62,10 +62,9 @@ interface PortalDataContextValue {
   staffAccounts: StaffAccount[];
   auditLogs: AuditLog[];
   dataLoading: boolean;
-  gatewayConfig: GatewayConfigStatus | null;
-  gatewayBalance: GatewayBalance | null;
-  balanceLoading: boolean;
-  refreshGatewayInfo: () => Promise<void>;
+  simBridgeStatus: SimBridgeStatus | null;
+  bridgeLoading: boolean;
+  refreshSimBridgeStatus: () => Promise<void>;
   activeDispatch: ActiveDispatchProgress | null;
   pauseActiveDispatch: () => void;
   resumeActiveDispatch: () => void;
@@ -75,11 +74,11 @@ interface PortalDataContextValue {
     name: string;
     messageTemplate: string;
     senderId: string;
+    deviceId?: string;
+    simSlot?: SimSlotPreference;
     groupIds: string[];
     recipients: RecipientItem[];
     scheduledAt?: string;
-    estimatedCost?: number;
-    currency?: string;
   }) => Promise<string>;
   runScheduledCampaignNow: (campaign: Campaign) => Promise<void>;
   retryFailedForCampaign: (campaign: Campaign) => Promise<{ retried: number; succeeded: number }>;
@@ -108,9 +107,8 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [dataLoading, setDataLoading] = useState(true);
 
-  const [gatewayConfig, setGatewayConfig] = useState<GatewayConfigStatus | null>(null);
-  const [gatewayBalance, setGatewayBalance] = useState<GatewayBalance | null>(null);
-  const [balanceLoading, setBalanceLoading] = useState(false);
+  const [simBridgeStatus, setSimBridgeStatus] = useState<SimBridgeStatus | null>(null);
+  const [bridgeLoading, setBridgeLoading] = useState(false);
 
   const [activeDispatch, setActiveDispatch] = useState<ActiveDispatchProgress | null>(null);
   const dispatchControlRef = useRef<{ paused: boolean; cancelled: boolean }>({
@@ -118,32 +116,22 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
     cancelled: false,
   });
 
-  const refreshGatewayInfo = useCallback(async () => {
+  const refreshSimBridgeStatus = useCallback(async () => {
     if (!authorized || !firebaseUser) return;
-    setBalanceLoading(true);
+    setBridgeLoading(true);
     try {
-      const cfg = await fetchGatewayConfigStatus();
-      setGatewayConfig(cfg);
-      if (cfg.configured) {
-        const bal = await fetchGatewayBalance();
-        setGatewayBalance(bal);
-      } else {
-        setGatewayBalance({
-          configured: false,
-          balance: null,
-          currency: 'USD',
-          error: 'SMS_IO_API_KEY not configured on server',
-        });
-      }
-    } catch (err) {
-      setGatewayBalance({
-        configured: false,
-        balance: null,
-        currency: 'USD',
-        error: err instanceof Error ? err.message : 'Unable to reach SMS gateway',
+      const status = await fetchSimBridgeStatus();
+      setSimBridgeStatus(status);
+    } catch {
+      setSimBridgeStatus({
+        simBridgeReady: false,
+        onlineDevicesCount: 0,
+        linkedDevicesCount: 0,
+        devices: [],
+        wsEndpoint: '/ws/mobile-bridge',
       });
     } finally {
-      setBalanceLoading(false);
+      setBridgeLoading(false);
     }
   }, [authorized, firebaseUser]);
 
@@ -247,12 +235,12 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       );
     }
 
-    void refreshGatewayInfo();
+    void refreshSimBridgeStatus();
 
     return () => {
       unsubs.forEach((u) => u());
     };
-  }, [authorized, firebaseUser, role, refreshGatewayInfo]);
+  }, [authorized, firebaseUser, role, refreshSimBridgeStatus]);
 
   const pauseActiveDispatch = useCallback(() => {
     dispatchControlRef.current.paused = true;
@@ -281,8 +269,9 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       campaignName: string;
       messageTemplate: string;
       senderId: string;
+      deviceId?: string;
+      simSlot?: SimSlotPreference;
       recipients: RecipientItem[];
-      currency: string;
     }) => {
       if (!firebaseUser?.email) return;
 
@@ -290,7 +279,6 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       let sentCount = 0;
       let deliveredCount = 0;
       let failedCount = 0;
-      let actualCost = 0;
 
       setActiveDispatch({
         campaignId: params.campaignId,
@@ -328,7 +316,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
               deliveredCount,
               failedCount,
               pendingCount: Math.max(0, params.recipients.length - (sentCount + failedCount)),
-              actualCost: Number(actualCost.toFixed(4)),
+              actualCost: 0,
               updatedAt: serverTimestamp(),
             });
           } catch (err) {
@@ -351,17 +339,19 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
             to: recipient.phone,
             message: personalized,
             senderId: params.senderId,
+            deviceId: params.deviceId,
+            simSlot: params.simSlot,
             idempotencyKey,
           });
         } catch (err) {
-          const msg = err instanceof Error ? err.message : 'SMS gateway dispatch failed';
+          const msg = err instanceof Error ? err.message : 'Android SIM dispatch failed';
           lastError = msg;
           res = {
             success: false,
             status: 'failed' as const,
             messageId: '',
             cost: 0,
-            currency: params.currency,
+            currency: 'SIM',
             segments: Math.max(1, segInfo.segments),
             httpStatus: 500,
             apiResponseSummary: msg.slice(0, 950),
@@ -372,28 +362,37 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         if (res.success) {
           sentCount += 1;
           if (res.status === 'delivered') deliveredCount += 1;
-          actualCost += Number(res.cost || 0);
         } else {
           failedCount += 1;
-          lastError = res.apiResponseSummary || res.error || 'Failed to send';
+          lastError = res.apiResponseSummary || res.error || 'Failed to send via SIM';
         }
+
+        const safeStatus = normalizeDeliveryStatus(res.status, res.success ? 'sent' : 'failed');
+        const safeSegments = Math.max(
+          1,
+          Math.min(20, Number.isFinite(Number(res.segments)) && Number(res.segments) >= 1 ? Math.round(Number(res.segments)) : segInfo.segments || 1)
+        );
+        const safeHttpStatus = Number.isFinite(Number(res.httpStatus)) && Number(res.httpStatus) >= 0
+          ? Math.round(Number(res.httpStatus))
+          : 0;
+        const resolvedSender = (res.simSender || params.senderId || 'ANDROID-SIM').slice(0, 15);
 
         // Persist transaction record to Firestore
         try {
           await setDoc(doc(db, 'sms_transactions', txId), {
             campaignId: params.campaignId,
-            campaignName: params.campaignName.slice(0, 140),
+            campaignName: (params.campaignName || 'SMS Campaign').slice(0, 140),
             recipientName: (recipient.name || 'Customer').slice(0, 120),
             recipientPhone: recipient.phone,
             messageContent: personalized,
-            senderId: params.senderId.slice(0, 15),
-            segments: Math.max(1, Math.min(20, res.segments || segInfo.segments || 1)),
-            cost: Number(res.cost || 0),
-            currency: (res.currency || params.currency || 'USD').slice(0, 12),
-            status: res.status,
+            senderId: resolvedSender,
+            segments: safeSegments,
+            cost: 0,
+            currency: 'SIM',
+            status: safeStatus,
             providerMessageId: (res.messageId || '').slice(0, 128),
-            apiResponseSummary: (res.apiResponseSummary || '').slice(0, 1000),
-            httpStatus: Number(res.httpStatus || 0),
+            apiResponseSummary: (res.apiResponseSummary || lastError || '').slice(0, 1000),
+            httpStatus: safeHttpStatus,
             idempotencyKey,
             retryCount: 0,
             orgId: ORG_ID,
@@ -430,7 +429,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
           deliveredCount,
           failedCount,
           pendingCount: 0,
-          actualCost: Number(actualCost.toFixed(4)),
+          actualCost: 0,
           updatedAt: serverTimestamp(),
         });
       } catch (err) {
@@ -444,13 +443,13 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         actorRole: role,
         targetType: 'campaign',
         targetId: params.campaignId,
-        summary: `Campaign "${params.campaignName}" finished (${sentCount} sent, ${failedCount} failed of ${params.recipients.length})`,
+        summary: `SIM campaign "${params.campaignName}" finished (${sentCount} sent, ${failedCount} failed of ${params.recipients.length})`,
       });
 
       setActiveDispatch((prev) => (prev ? { ...prev, running: false } : null));
-      void refreshGatewayInfo();
+      void refreshSimBridgeStatus();
     },
-    [firebaseUser, role, refreshGatewayInfo]
+    [firebaseUser, role, refreshSimBridgeStatus]
   );
 
   const executeBulkCampaign = useCallback(
@@ -458,17 +457,17 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       name: string;
       messageTemplate: string;
       senderId: string;
+      deviceId?: string;
+      simSlot?: SimSlotPreference;
       groupIds: string[];
       recipients: RecipientItem[];
       scheduledAt?: string;
-      estimatedCost?: number;
-      currency?: string;
     }): Promise<string> => {
       if (!firebaseUser?.email) throw new Error('Not signed in');
 
       const campaignId = generateSafeId('camp');
       const isScheduled = Boolean(params.scheduledAt && params.scheduledAt.trim().length > 0);
-      const currency = (params.currency || 'USD').slice(0, 12);
+      const safeSender = (params.senderId.trim() || 'ANDROID-SIM').slice(0, 15);
 
       // Compute total estimated segments across personalized messages
       const totalSegments = params.recipients.reduce((acc, r) => {
@@ -480,7 +479,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         await setDoc(doc(db, 'campaigns', campaignId), {
           name: params.name.trim().slice(0, 140),
           messageTemplate: params.messageTemplate.trim().slice(0, 1600),
-          senderId: params.senderId.trim().slice(0, 15) || 'ZACMA',
+          senderId: safeSender,
           groupIds: params.groupIds.slice(0, 20),
           recipientCount: params.recipients.length,
           sentCount: 0,
@@ -488,9 +487,9 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
           failedCount: 0,
           pendingCount: params.recipients.length,
           estimatedSegments: totalSegments,
-          estimatedCost: Number(params.estimatedCost || 0),
+          estimatedCost: 0,
           actualCost: 0,
-          currency,
+          currency: 'SIM',
           status: isScheduled ? 'scheduled' : 'sending',
           scheduledAt: isScheduled ? (params.scheduledAt || '').slice(0, 40) : '',
           orgId: ORG_ID,
@@ -510,7 +509,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         actorRole: role,
         targetType: 'campaign',
         targetId: campaignId,
-        summary: `${isScheduled ? 'Scheduled' : 'Started'} "${params.name}" for ${params.recipients.length} recipients (${totalSegments} segments)`,
+        summary: `${isScheduled ? 'Scheduled' : 'Started'} "${params.name}" via ${safeSender} for ${params.recipients.length} recipients (${totalSegments} segments)`,
       });
 
       if (!isScheduled) {
@@ -518,9 +517,10 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
           campaignId,
           campaignName: params.name.trim(),
           messageTemplate: params.messageTemplate.trim(),
-          senderId: params.senderId.trim() || 'ZACMA',
+          senderId: safeSender,
+          deviceId: params.deviceId,
+          simSlot: params.simSlot,
           recipients: params.recipients,
-          currency,
         });
       }
 
@@ -557,9 +557,8 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         campaignId: campaign.id,
         campaignName: campaign.name,
         messageTemplate: campaign.messageTemplate,
-        senderId: campaign.senderId,
+        senderId: campaign.senderId || 'ANDROID-SIM',
         recipients,
-        currency: campaign.currency || 'USD',
       });
     },
     [contacts, firebaseUser, runRecipientsLoop]
@@ -573,21 +572,40 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       const nextAttempt = (tx.retryCount || 0) + 1;
       const newKey = buildIdempotencyKey(tx.campaignId, tx.recipientPhone, nextAttempt);
 
-      const res = await dispatchSingleSms({
-        to: tx.recipientPhone,
-        message: tx.messageContent,
-        senderId: tx.senderId,
-        idempotencyKey: newKey,
-      });
+      let res;
+      try {
+        res = await dispatchSingleSms({
+          to: tx.recipientPhone,
+          message: tx.messageContent,
+          senderId: tx.senderId,
+          idempotencyKey: newKey,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Android SIM retry failed';
+        res = {
+          success: false,
+          status: 'failed' as const,
+          messageId: '',
+          cost: 0,
+          currency: 'SIM',
+          segments: Math.max(1, tx.segments || 1),
+          httpStatus: 500,
+          apiResponseSummary: msg.slice(0, 950),
+          deduplicated: false,
+        };
+      }
+
+      const safeRetryStatus = normalizeDeliveryStatus(res.status, res.success ? 'sent' : 'failed');
+      const safeRetryHttp = Number.isFinite(Number(res.httpStatus)) ? Math.round(Number(res.httpStatus)) : 0;
 
       try {
         await updateDoc(doc(db, 'sms_transactions', tx.id), {
-          status: res.status,
+          status: safeRetryStatus,
           providerMessageId: (res.messageId || tx.providerMessageId || '').slice(0, 128),
           apiResponseSummary: (res.apiResponseSummary || '').slice(0, 1000),
-          httpStatus: Number(res.httpStatus || 0),
-          cost: Number(res.cost || tx.cost || 0),
-          segments: Math.max(1, Math.min(20, res.segments || tx.segments || 1)),
+          httpStatus: safeRetryHttp,
+          cost: 0,
+          segments: Math.max(1, Math.min(20, Number(res.segments) || tx.segments || 1)),
           retryCount: Math.min(10, nextAttempt),
           updatedAt: serverTimestamp(),
         });
@@ -603,7 +621,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
             await updateDoc(doc(db, 'campaigns', parent.id), {
               sentCount: parent.sentCount + 1,
               failedCount: Math.max(0, parent.failedCount - 1),
-              actualCost: Number((parent.actualCost + Number(res.cost || 0)).toFixed(4)),
+              actualCost: 0,
               status: parent.failedCount <= 1 ? 'completed' : parent.status,
               updatedAt: serverTimestamp(),
             });
@@ -664,14 +682,17 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       for (const tx of candidates) {
         const upd = updates[tx.providerMessageId];
         if (!upd) continue;
-        if (upd.status !== tx.status || (upd.cost !== undefined && upd.cost !== tx.cost)) {
+        const safeUpdStatus = normalizeDeliveryStatus(upd.status, tx.status);
+        if (safeUpdStatus !== tx.status) {
           try {
             await updateDoc(doc(db, 'sms_transactions', tx.id), {
-              status: upd.status,
-              cost: upd.cost !== undefined ? upd.cost : tx.cost,
-              segments: upd.segments !== undefined ? Math.min(20, Math.max(1, upd.segments)) : tx.segments,
-              httpStatus: upd.httpStatus,
-              apiResponseSummary: upd.apiResponseSummary.slice(0, 1000),
+              status: safeUpdStatus,
+              segments:
+                upd.segments !== undefined && Number.isFinite(Number(upd.segments))
+                  ? Math.min(20, Math.max(1, Math.round(Number(upd.segments))))
+                  : tx.segments,
+              httpStatus: Number.isFinite(Number(upd.httpStatus)) ? Math.round(Number(upd.httpStatus)) : tx.httpStatus,
+              apiResponseSummary: (upd.apiResponseSummary || '').slice(0, 1000),
               updatedAt: serverTimestamp(),
             });
             updatedCount += 1;
@@ -716,10 +737,9 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         staffAccounts,
         auditLogs,
         dataLoading,
-        gatewayConfig,
-        gatewayBalance,
-        balanceLoading,
-        refreshGatewayInfo,
+        simBridgeStatus,
+        bridgeLoading,
+        refreshSimBridgeStatus,
         activeDispatch,
         pauseActiveDispatch,
         resumeActiveDispatch,

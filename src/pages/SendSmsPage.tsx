@@ -3,7 +3,7 @@ import {
   Send,
   Upload,
   CalendarClock,
-  Calculator,
+  Smartphone,
   CheckCircle2,
   AlertCircle,
   Eye,
@@ -11,10 +11,10 @@ import {
   ChevronLeft,
   ChevronRight,
   Trash2,
+  ExternalLink,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { usePortalData } from '../context/PortalDataContext';
-import { estimateSmsCost } from '../lib/api';
 import {
   analyzeSmsMessage,
   isValidE164Phone,
@@ -22,20 +22,32 @@ import {
   parseContactsSpreadsheet,
   renderPersonalizedMessage,
 } from '../lib/smsUtils';
-import type { PortalTab, RecipientItem } from '../types/portal';
+import type { PortalTab, RecipientItem, SimSlotPreference } from '../types/portal';
+
+const SIM_SLOT_OPTIONS: { value: SimSlotPreference; label: string }[] = [
+  { value: 'auto', label: 'Auto SIM' },
+  { value: 'sim1', label: 'SIM 1' },
+  { value: 'sim2', label: 'SIM 2' },
+];
+
+function sanitizeSenderLabel(raw: string): string {
+  const cleaned = raw.replace(/[^a-zA-Z0-9 +\-_.]/g, '').trim().slice(0, 15);
+  return cleaned || 'ANDROID-SIM';
+}
 
 export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => void }) {
   const { permissions } = useAuth();
   const {
     groups,
     contacts,
-    gatewayConfig,
+    simBridgeStatus,
     executeBulkCampaign,
     activeDispatch,
   } = usePortalData();
 
   const [campaignName, setCampaignName] = useState('');
-  const [senderId, setSenderId] = useState(gatewayConfig?.senderId || 'ZACMA');
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('auto');
+  const [simSlot, setSimSlot] = useState<SimSlotPreference>('auto');
   const [manualInput, setManualInput] = useState('');
   const [defaultEthiopia, setDefaultEthiopia] = useState(true);
   const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([]);
@@ -46,18 +58,33 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
   const [scheduledAt, setScheduledAt] = useState('');
 
   const [previewIdx, setPreviewIdx] = useState(0);
-  const [estimating, setEstimating] = useState(false);
-  const [estimateResult, setEstimateResult] = useState<{
-    cost: number | null;
-    currency: string;
-    note: string;
-  } | null>(null);
-
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const linkedDevices = simBridgeStatus?.devices || [];
+  const onlineDevices = useMemo(
+    () => linkedDevices.filter((d) => d.online),
+    [linkedDevices]
+  );
+
+  const activeDevice = useMemo(() => {
+    if (selectedDeviceId !== 'auto') {
+      return linkedDevices.find((d) => d.id === selectedDeviceId) || null;
+    }
+    return onlineDevices[0] || linkedDevices[0] || null;
+  }, [linkedDevices, onlineDevices, selectedDeviceId]);
+
+  const effectiveSenderLabel = useMemo(() => {
+    if (activeDevice?.phoneNumber && activeDevice.phoneNumber !== 'SIM Primary') {
+      return sanitizeSenderLabel(activeDevice.phoneNumber);
+    }
+    if (simSlot === 'sim1') return 'SIM-1';
+    if (simSlot === 'sim2') return 'SIM-2';
+    return 'ANDROID-SIM';
+  }, [activeDevice, simSlot]);
 
   // Parse manual numbers
   const manualParsed = useMemo(() => {
@@ -134,6 +161,17 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
     [messageTemplate, currentPreviewRecipient]
   );
 
+  // Native Android sms: deep-link for direct handset sending from mobile browser
+  const nativeAndroidSmsHref = useMemo(() => {
+    if (combinedRecipients.length === 0 || !messageTemplate.trim()) return '';
+    const recipientList = combinedRecipients.slice(0, 50).map((r) => r.phone).join(',');
+    const bodyText =
+      combinedRecipients.length === 1
+        ? renderPersonalizedMessage(messageTemplate, combinedRecipients[0])
+        : messageTemplate.trim();
+    return `sms:${recipientList}?body=${encodeURIComponent(bodyText)}`;
+  }, [combinedRecipients, messageTemplate]);
+
   const toggleGroup = (id: string) => {
     setSelectedGroupIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
@@ -175,47 +213,6 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
     }
   };
 
-  const handleEstimateCost = async () => {
-    setFeedback(null);
-    if (combinedRecipients.length === 0 || !messageTemplate.trim()) {
-      setFeedback({
-        type: 'error',
-        text: 'Add at least one valid recipient and write a message to estimate cost.',
-      });
-      return;
-    }
-
-    setEstimating(true);
-    try {
-      const res = await estimateSmsCost({
-        to: combinedRecipients.map((r) => r.phone),
-        message: renderPersonalizedMessage(messageTemplate, combinedRecipients[0]),
-        senderId: senderId.trim() || 'ZACMA',
-      });
-      if (res.estimatedCost !== null) {
-        setEstimateResult({
-          cost: res.estimatedCost,
-          currency: res.currency || 'USD',
-          note: `Live SMS.io estimate for ${combinedRecipients.length} recipients (${res.estimatedSegments} segments)`,
-        });
-      } else {
-        setEstimateResult({
-          cost: null,
-          currency: res.currency || 'USD',
-          note: res.error || 'SMS.io did not return a numeric cost estimate.',
-        });
-      }
-    } catch (err) {
-      setEstimateResult({
-        cost: null,
-        currency: 'USD',
-        note: err instanceof Error ? err.message : 'Cost estimate failed.',
-      });
-    } finally {
-      setEstimating(false);
-    }
-  };
-
   const handleOpenConfirmation = (e: React.FormEvent) => {
     e.preventDefault();
     setFeedback(null);
@@ -250,6 +247,13 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
       });
       return;
     }
+    if (sendMode === 'now' && onlineDevices.length === 0) {
+      setFeedback({
+        type: 'error',
+        text: 'No paired Android phone is currently online. Pair your phone on the Dashboard first, or use "Open in Phone Messages" below on an Android handset.',
+      });
+      return;
+    }
 
     setConfirmOpen(true);
   };
@@ -261,18 +265,18 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
 
     const finalName =
       campaignName.trim() ||
-      `Bulk SMS ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
+      `SIM Bulk SMS ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`;
 
     try {
       await executeBulkCampaign({
         name: finalName,
         messageTemplate: messageTemplate.trim(),
-        senderId: senderId.trim() || 'ZACMA',
+        senderId: effectiveSenderLabel,
+        deviceId: selectedDeviceId !== 'auto' ? selectedDeviceId : undefined,
+        simSlot,
         groupIds: selectedGroupIds,
         recipients: combinedRecipients,
         scheduledAt: sendMode === 'schedule' ? scheduledAt : undefined,
-        estimatedCost: estimateResult?.cost ?? 0,
-        currency: estimateResult?.currency || 'USD',
       });
 
       setFeedback({
@@ -280,18 +284,17 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
         text:
           sendMode === 'schedule'
             ? `Campaign "${finalName}" scheduled successfully.`
-            : `Campaign "${finalName}" finished processing. View full delivery logs in SMS History.`,
+            : `Campaign "${finalName}" finished dispatching via Android SIM. View full delivery logs in SMS History.`,
       });
       setCampaignName('');
       setManualInput('');
       setUploadedRecipients([]);
       setUploadStats(null);
       setMessageTemplate('');
-      setEstimateResult(null);
     } catch (err) {
       setFeedback({
         type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to execute bulk campaign.',
+        text: err instanceof Error ? err.message : 'Failed to execute SIM bulk campaign.',
       });
     } finally {
       setSubmitting(false);
@@ -304,6 +307,33 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
         <div className="bg-red-50 border border-red-200 rounded-2xl p-4 text-sm text-red-700">
           Your role currently has view-only access and cannot send bulk SMS campaigns. Contact a
           ZACMA Technology administrator to enable bulk sending.
+        </div>
+      )}
+
+      {onlineDevices.length === 0 && (
+        <div className="bg-white border border-blue-200 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+              <Smartphone className="w-4 h-4" />
+            </div>
+            <div className="space-y-0.5">
+              <p className="text-sm font-bold text-slate-900">
+                Connect Your Android Phone for Automated Bulk SIM Dispatch
+              </p>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Pair your phone via QR code on the Dashboard to send bulk campaigns directly through
+                your SIM card, or tap <strong>Open in Phone Messages</strong> when using this portal
+                on your Android device.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigate('dashboard')}
+            className="min-h-[42px] px-4 py-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold cursor-pointer whitespace-nowrap shrink-0"
+          >
+            Pair Phone via QR
+          </button>
         </div>
       )}
 
@@ -329,7 +359,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                   onClick={() => onNavigate('history')}
                   className="text-xs font-semibold underline cursor-pointer"
                 >
-                  Open SMS History & Delivery Reports
+                  Open SMS History &amp; Delivery Reports
                 </button>
               )}
             </div>
@@ -346,42 +376,83 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
       )}
 
       <form onSubmit={handleOpenConfirmation} className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Left Column: Recipients & Message Composition */}
+        {/* Left Column: SIM Route, Recipients & Message Composition */}
         <div className="lg:col-span-7 space-y-6">
-          {/* Campaign Details */}
+          {/* Campaign Details & Dual SIM Routing */}
           <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
-            <h2 className="font-display text-base font-bold text-slate-900">1. Campaign Details</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="sm:col-span-2 space-y-1.5">
-                <label htmlFor="camp-name" className="block text-xs font-semibold text-slate-700">
-                  Campaign Name
+            <h2 className="font-display text-base font-bold text-slate-900">
+              1. Campaign &amp; Phone SIM Selection
+            </h2>
+
+            <div className="space-y-1.5">
+              <label htmlFor="camp-name" className="block text-xs font-semibold text-slate-700">
+                Campaign Name
+              </label>
+              <input
+                id="camp-name"
+                type="text"
+                maxLength={140}
+                value={campaignName}
+                onChange={(e) => setCampaignName(e.target.value)}
+                placeholder="e.g. Monthly Invoice Reminder — Addis Ababa"
+                className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+              <div className="space-y-1.5">
+                <label htmlFor="sim-device" className="block text-xs font-semibold text-slate-700">
+                  Android Handset
                 </label>
-                <input
-                  id="camp-name"
-                  type="text"
-                  maxLength={140}
-                  value={campaignName}
-                  onChange={(e) => setCampaignName(e.target.value)}
-                  placeholder="e.g. Monthly Invoice Reminder — Addis Ababa"
-                  className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-600"
-                />
+                <select
+                  id="sim-device"
+                  value={selectedDeviceId}
+                  onChange={(e) => setSelectedDeviceId(e.target.value)}
+                  className="w-full min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 text-sm text-slate-900 bg-white focus:border-blue-600"
+                >
+                  <option value="auto">
+                    {onlineDevices.length > 0
+                      ? `Auto (${onlineDevices[0].deviceName} · ${onlineDevices[0].phoneNumber})`
+                      : 'Auto (Active Linked Handset)'}
+                  </option>
+                  {linkedDevices.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.deviceName} ({d.phoneNumber}) — {d.online ? 'Online' : 'Offline'}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div className="space-y-1.5">
-                <label htmlFor="sender-id" className="block text-xs font-semibold text-slate-700">
-                  Sender ID
-                </label>
-                <input
-                  id="sender-id"
-                  type="text"
-                  maxLength={11}
-                  value={senderId}
-                  onChange={(e) => setSenderId(e.target.value)}
-                  placeholder="ZACMA"
-                  className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl border border-slate-300 font-mono text-sm text-slate-900 focus:border-blue-600"
-                />
+                <span className="block text-xs font-semibold text-slate-700">Dual SIM Slot</span>
+                <div
+                  className="grid grid-cols-3 gap-1 p-1 bg-slate-100 rounded-xl"
+                  role="group"
+                  aria-label="Select SIM card slot"
+                >
+                  {SIM_SLOT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setSimSlot(opt.value)}
+                      className={`min-h-[36px] rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                        simSlot === opt.value
+                          ? 'bg-white text-blue-700 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
+
+            <p className="text-xs text-slate-500">
+              Messages send directly from your mobile number (
+              <span className="font-mono text-slate-700">{effectiveSenderLabel}</span>) using your
+              SIM card&apos;s own airtime or SMS package.
+            </p>
           </div>
 
           {/* Recipients Selection */}
@@ -554,7 +625,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
-                  Send Immediately
+                  Send Immediately via SIM
                 </button>
                 <button
                   type="button"
@@ -572,7 +643,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
               {sendMode === 'schedule' && (
                 <div className="space-y-1.5">
                   <label htmlFor="schedule-dt" className="block text-xs font-semibold text-slate-700">
-                    Scheduled Dispatch Date & Time
+                    Scheduled Dispatch Date &amp; Time
                   </label>
                   <input
                     id="schedule-dt"
@@ -587,7 +658,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
           </div>
         </div>
 
-        {/* Right Column: Live Preview, Cost Estimate & Action CTA */}
+        {/* Right Column: Live Preview, SIM Summary & Action CTAs */}
         <div className="lg:col-span-5 space-y-5 lg:sticky lg:top-20">
           {/* Live Handset Preview */}
           <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
@@ -627,7 +698,9 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
 
             <div className="bg-slate-950 rounded-2xl p-4 space-y-3 text-white">
               <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2.5">
-                <span className="font-mono font-semibold text-blue-300">{senderId || 'ZACMA'}</span>
+                <span className="font-mono font-semibold text-blue-300">
+                  {effectiveSenderLabel}
+                </span>
                 <span className="font-mono text-slate-400">{currentPreviewRecipient.phone}</span>
               </div>
               <div className="bg-slate-800/90 rounded-xl p-3.5 text-sm text-slate-100 whitespace-pre-wrap break-words min-h-[84px] leading-relaxed">
@@ -643,9 +716,9 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
             </div>
           </div>
 
-          {/* Summary & Cost Estimator */}
+          {/* SIM Dispatch Summary */}
           <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
-            <h3 className="font-display text-sm font-bold text-slate-900">Campaign Summary</h3>
+            <h3 className="font-display text-sm font-bold text-slate-900">SIM Dispatch Summary</h3>
 
             <dl className="space-y-2.5 text-sm">
               <div className="flex justify-between">
@@ -655,7 +728,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                 </dd>
               </div>
               <div className="flex justify-between">
-                <dt className="text-slate-500">Estimated Total Segments</dt>
+                <dt className="text-slate-500">Total SIM Segments</dt>
                 <dd className="font-mono tabular-nums font-semibold text-slate-900">
                   {totalEstimatedSegments.toLocaleString()}
                 </dd>
@@ -664,31 +737,20 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                 <dt className="text-slate-500">Encoding</dt>
                 <dd className="font-mono font-medium text-slate-800">{msgMetrics.encoding}</dd>
               </div>
-              {estimateResult && (
-                <div className="flex justify-between pt-2 border-t border-slate-100">
-                  <dt className="text-slate-600 font-medium">SMS.io Est. Cost</dt>
-                  <dd className="font-mono tabular-nums font-bold text-blue-700">
-                    {estimateResult.cost !== null
-                      ? `${estimateResult.currency} ${estimateResult.cost.toFixed(4)}`
-                      : 'Unavailable'}
-                  </dd>
-                </div>
-              )}
+              <div className="flex justify-between pt-2 border-t border-slate-100">
+                <dt className="text-slate-500">Dispatch Line</dt>
+                <dd className="font-mono text-xs font-semibold text-blue-700">
+                  {activeDevice
+                    ? `${activeDevice.deviceName} · ${simSlot.toUpperCase()}`
+                    : `${simSlot.toUpperCase()} (Not paired)`}
+                </dd>
+              </div>
             </dl>
 
-            {estimateResult?.note && (
-              <p className="text-xs text-slate-500 leading-relaxed">{estimateResult.note}</p>
-            )}
-
-            <button
-              type="button"
-              onClick={() => void handleEstimateCost()}
-              disabled={estimating || combinedRecipients.length === 0 || !messageTemplate.trim()}
-              className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs sm:text-sm font-semibold px-4 transition-colors cursor-pointer disabled:opacity-50"
-            >
-              <Calculator className="w-4 h-4 text-blue-700" />
-              {estimating ? 'Calculating via SMS.io...' : 'Estimate SMS Cost'}
-            </button>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Standard operator airtime or SMS package rates apply on your SIM card. No third-party
+              SMS API fees.
+            </p>
 
             <button
               type="submit"
@@ -704,15 +766,27 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
               {sendMode === 'schedule' ? (
                 <>
                   <CalendarClock className="w-4 h-4" />
-                  <span>Review & Schedule Campaign</span>
+                  <span>Review &amp; Schedule Campaign</span>
                 </>
               ) : (
                 <>
                   <Send className="w-4 h-4" />
-                  <span>Review & Send Bulk SMS</span>
+                  <span>Review &amp; Send via Phone SIM</span>
                 </>
               )}
             </button>
+
+            {nativeAndroidSmsHref && (
+              <a
+                href={nativeAndroidSmsHref}
+                className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-slate-800 text-xs sm:text-sm font-semibold px-4 transition-colors"
+              >
+                <ExternalLink className="w-4 h-4 text-blue-700" />
+                <span>
+                  Open in Phone Messages App ({Math.min(combinedRecipients.length, 50)})
+                </span>
+              </a>
+            )}
           </div>
         </div>
       </form>
@@ -730,10 +804,11 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
             <div className="flex items-start justify-between gap-4">
               <div>
                 <h3 className="font-display text-lg font-bold text-slate-900">
-                  Confirm Bulk SMS Execution
+                  Confirm SIM SMS Dispatch
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Verify all campaign parameters before dispatching through SMS.io.
+                  Messages will be sent directly from your paired Android phone SIM card using your
+                  mobile operator&apos;s airtime or SMS package.
                 </p>
               </div>
               <button
@@ -749,11 +824,21 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
             <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2 text-xs">
               <div className="flex justify-between">
                 <span className="text-slate-500">Campaign</span>
-                <span className="font-semibold text-slate-900">{campaignName.trim() || 'Bulk SMS Dispatch'}</span>
+                <span className="font-semibold text-slate-900">
+                  {campaignName.trim() || 'SIM Bulk SMS Dispatch'}
+                </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Sender ID</span>
-                <span className="font-mono font-semibold text-slate-900">{senderId || 'ZACMA'}</span>
+                <span className="text-slate-500">Android Handset</span>
+                <span className="font-semibold text-slate-900">
+                  {activeDevice ? `${activeDevice.deviceName} (${activeDevice.carrierName})` : 'Active Linked Handset'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500">SIM Number / Slot</span>
+                <span className="font-mono font-semibold text-slate-900">
+                  {effectiveSenderLabel} · {simSlot.toUpperCase()}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Recipients</span>
@@ -762,7 +847,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-500">Total Segments</span>
+                <span className="text-slate-500">Total SIM Segments</span>
                 <span className="font-mono font-semibold text-slate-900">
                   {totalEstimatedSegments.toLocaleString()}
                 </span>
@@ -794,7 +879,7 @@ export function SendSmsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => vo
                 onClick={() => void handleConfirmExecute()}
                 className="flex-1 min-h-[46px] rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-semibold cursor-pointer"
               >
-                {sendMode === 'schedule' ? 'Confirm Schedule' : 'Confirm & Send Now'}
+                {sendMode === 'schedule' ? 'Confirm Schedule' : 'Confirm & Send via SIM'}
               </button>
             </div>
           </div>

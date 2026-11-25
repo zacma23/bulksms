@@ -130,20 +130,12 @@ export interface AuditLog {
   createdAt: Timestamp;
 }
 
-export interface GatewayConfigStatus {
-  configured: boolean;
-  senderId: string;
-  apiBaseUrl: string;
-  authBaseUrl: string;
-  webhookPath: string;
-}
-
-export interface GatewayBalance {
-  configured: boolean;
-  balance: number | null;
-  currency: string;
-  httpStatus?: number;
-  error?: string;
+export interface SimBridgeStatus {
+  simBridgeReady: boolean;
+  onlineDevicesCount: number;
+  linkedDevicesCount: number;
+  devices: LinkedMobileDevice[];
+  wsEndpoint: string;
 }
 
 export interface RecipientItem {
@@ -160,3 +152,35 @@ export type PortalTab =
   | 'history'
   | 'staff'
   | 'audit';
+
+export type SimSlotPreference = 'auto' | 'sim1' | 'sim2';
+
+export interface MobilePairingSession {
+  pairingCode: string;
+  shortPin: string;
+  simSlot: SimSlotPreference;
+  serverUrl: string;
+  pairEndpoint: string;
+  wsEndpoint: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface LinkedMobileDevice {
+  id: string;
+  deviceName: string;
+  androidVersion: string;
+  phoneNumber: string;
+  carrierName: string;
+  simSlot: SimSlotPreference;
+  dualSimSupported: boolean;
+  online: boolean;
+  connectedAt: string;
+  lastSeenAt: string;
+  linkedByEmail: string;
+}
+
+export interface MobileDeviceStatusResponse {
+  devices: LinkedMobileDevice[];
+  activeSession: MobilePairingSession | null;
+}

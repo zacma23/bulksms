@@ -134,13 +134,13 @@ export function CampaignsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
         type: 'success',
         text:
           count > 0
-            ? `Updated delivery status for ${count} messages from SMS.io.`
-            : 'All tracked messages are already up to date.',
+            ? `Updated delivery status for ${count} messages from Android SIM receipts.`
+            : 'All tracked SIM messages are already up to date.',
       });
     } catch (err) {
       setFeedback({
         type: 'error',
-        text: err instanceof Error ? err.message : 'Failed to sync delivery reports from SMS.io.',
+        text: err instanceof Error ? err.message : 'Failed to sync Android SIM delivery receipts.',
       });
     } finally {
       setSyncing(false);
@@ -251,7 +251,7 @@ export function CampaignsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
                     </div>
 
                     <p className="text-xs text-slate-500">
-                      Sender: <span className="font-mono text-slate-700">{camp.senderId}</span> · Created{' '}
+                      SIM Line: <span className="font-mono text-slate-700">{camp.senderId}</span> · Created{' '}
                       {formatTimestamp(camp.createdAt)} by {camp.createdByEmail}
                       {camp.scheduledAt && ` · Scheduled: ${formatTimestamp(camp.scheduledAt)}`}
                     </p>
@@ -302,8 +302,7 @@ export function CampaignsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
                 {/* Action Row */}
                 <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
                   <div className="text-xs font-mono tabular-nums text-slate-500">
-                    {camp.estimatedSegments} est. segments · Spend: {camp.currency || 'USD'}{' '}
-                    {(camp.actualCost || 0).toFixed(4)}
+                    {camp.estimatedSegments} SIM segments · Direct mobile operator package
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
@@ -387,7 +386,7 @@ export function CampaignsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
                   {selectedCampaign.name} — Delivery Report
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  {selectedCampaignTxs.length} logged transactions · Sender {selectedCampaign.senderId}
+                  {selectedCampaignTxs.length} logged SIM dispatches · Line {selectedCampaign.senderId}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -441,8 +440,8 @@ export function CampaignsPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
                     </div>
                     <p className="text-slate-600">{tx.messageContent}</p>
                     <p className="font-mono text-[11px] text-slate-500 break-all">
-                      ID: {tx.providerMessageId || '—'} · {tx.segments} seg · {tx.currency}{' '}
-                      {tx.cost.toFixed(4)} · API: {tx.apiResponseSummary || '—'}
+                      Dispatch ID: {tx.providerMessageId || '—'} · {tx.segments} seg · SIM:{' '}
+                      {tx.apiResponseSummary || '—'}
                     </p>
                   </div>
                 ))

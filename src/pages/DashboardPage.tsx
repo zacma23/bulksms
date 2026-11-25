@@ -15,11 +15,11 @@ import {
   RefreshCw,
   Send,
   Users,
-  AlertTriangle,
+  Smartphone,
   ArrowRight,
-  Wallet,
 } from 'lucide-react';
 import { usePortalData } from '../context/PortalDataContext';
+import { ConnectMobileDevice } from '../components/ConnectMobileDevice';
 import { formatTimestamp } from '../lib/smsUtils';
 import type { PortalTab } from '../types/portal';
 
@@ -32,10 +32,9 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
     campaigns,
     transactions,
     dataLoading,
-    gatewayConfig,
-    gatewayBalance,
-    balanceLoading,
-    refreshGatewayInfo,
+    simBridgeStatus,
+    bridgeLoading,
+    refreshSimBridgeStatus,
   } = usePortalData();
 
   const [period, setPeriod] = useState<ReportPeriod>('daily');
@@ -51,7 +50,6 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
     ).length;
     const pending = transactions.filter((t) => t.status === 'pending').length;
     const totalSegments = transactions.reduce((acc, t) => acc + (t.segments || 1), 0);
-    const totalSpend = transactions.reduce((acc, t) => acc + (t.cost || 0), 0);
     const deliveryRate = totalSent > 0 ? Math.round((successful / totalSent) * 100) : 0;
 
     return {
@@ -61,10 +59,18 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
       failed,
       pending,
       totalSegments,
-      totalSpend,
       deliveryRate,
     };
   }, [transactions]);
+
+  const activeSimDevice = useMemo(
+    () => simBridgeStatus?.devices.find((d) => d.online) || simBridgeStatus?.devices[0] || null,
+    [simBridgeStatus]
+  );
+
+  const scrollToConnectDevice = () => {
+    document.getElementById('connect-mobile-device')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   // 30-day SMS Sent vs. Failed trend data for the Recharts LineChart
   const thirtyDayTrendData = useMemo(() => {
@@ -174,30 +180,30 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
 
   return (
     <div className="space-y-6">
-      {/* Gateway Configuration Alert if SMS_IO_API_KEY is missing */}
-      {gatewayConfig && !gatewayConfig.configured && (
-        <div className="bg-white border border-red-200 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      {/* Prompt to link Android SIM phone when no device is currently online */}
+      {simBridgeStatus && !simBridgeStatus.simBridgeReady && (
+        <div className="bg-white border border-blue-200 rounded-2xl p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-start gap-3">
-            <div className="w-10 h-10 rounded-xl bg-red-50 text-red-600 flex items-center justify-center shrink-0">
-              <AlertTriangle className="w-5 h-5" />
+            <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+              <Smartphone className="w-5 h-5" />
             </div>
             <div className="space-y-0.5">
               <h2 className="font-display text-sm font-bold text-slate-900">
-                SMS_IO_API_KEY Environment Variable Not Set
+                Link Your Android Phone to Send via SIM Card
               </h2>
               <p className="text-xs text-slate-600 leading-relaxed">
-                Add <code className="font-mono bg-slate-100 px-1.5 py-0.5 rounded text-slate-800">SMS_IO_API_KEY</code> in
-                your server environment or Vercel Project Settings to enable live balance checks and
-                SMS dispatch through <span className="font-mono">{gatewayConfig.apiBaseUrl}</span>.
+                No Android handset is currently online. Scan the QR code below with the ZACMA
+                companion app to send bulk SMS directly from your own mobile number and SIM package —
+                no paid third-party gateway required.
               </p>
             </div>
           </div>
           <button
             type="button"
-            onClick={() => onNavigate('audit')}
-            className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 cursor-pointer whitespace-nowrap shrink-0"
+            onClick={scrollToConnectDevice}
+            className="min-h-[42px] px-4 py-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-xs font-semibold text-white cursor-pointer whitespace-nowrap shrink-0"
           >
-            Gateway Details
+            Pair Android SIM
           </button>
         </div>
       )}
@@ -247,30 +253,30 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
         <div className="col-span-2 lg:col-span-1 bg-slate-950 text-white rounded-2xl p-4 sm:p-5 flex flex-col justify-between space-y-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-slate-300 flex items-center gap-1.5">
-              <Wallet className="w-3.5 h-3.5 text-blue-400" />
-              SMS.io Balance
+              <Smartphone className="w-3.5 h-3.5 text-blue-400" />
+              Android SIM Bridge
             </span>
             <button
               type="button"
-              onClick={() => void refreshGatewayInfo()}
-              disabled={balanceLoading}
+              onClick={() => void refreshSimBridgeStatus()}
+              disabled={bridgeLoading}
               className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50"
-              aria-label="Refresh SMS.io balance"
+              aria-label="Refresh Android SIM bridge status"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${balanceLoading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${bridgeLoading ? 'animate-spin' : ''}`} />
             </button>
           </div>
           <p className="font-mono tabular-nums text-2xl sm:text-3xl font-semibold text-white">
-            {balanceLoading
+            {bridgeLoading
               ? '...'
-              : gatewayBalance?.balance !== null && gatewayBalance?.balance !== undefined
-                ? `${gatewayBalance.currency} ${gatewayBalance.balance.toFixed(2)}`
-                : 'N/A'}
+              : simBridgeStatus?.simBridgeReady
+                ? `${simBridgeStatus.onlineDevicesCount} Online`
+                : '0 Online'}
           </p>
           <p className="text-xs text-slate-400 truncate">
-            {gatewayBalance?.configured
-              ? gatewayBalance.error || `Tracked spend: $${stats.totalSpend.toFixed(2)}`
-              : 'Set SMS_IO_API_KEY'}
+            {activeSimDevice
+              ? `${activeSimDevice.phoneNumber} · ${activeSimDevice.carrierName}`
+              : 'Direct SIM · Zero API fees'}
           </p>
         </div>
       </section>
@@ -311,6 +317,9 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
           <ArrowRight className="w-5 h-5 text-slate-400 shrink-0" />
         </button>
       </section>
+
+      {/* Connect Mobile Device (Android SIM Bridge QR Pairing) */}
+      <ConnectMobileDevice />
 
       {/* 30-Day SMS Sent vs. Failed Line Chart */}
       <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5">

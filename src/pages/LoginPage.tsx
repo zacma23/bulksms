@@ -85,8 +85,8 @@ export function LoginPage() {
             </div>
             <p className="text-xs text-blue-900 leading-relaxed">
               Signed in as <span className="font-mono">{firebaseUser?.email}</span>. For security,
-              ZACMA SMS PORTAL requires a verified email before accessing contacts or SMS gateways.
-              Open the verification link in your inbox, then continue below.
+              ZACMA SMS PORTAL requires a verified email before accessing contacts or Android SIM
+              dispatch controls. Open the verification link in your inbox, then continue below.
             </p>
           </div>
 
@@ -201,29 +201,29 @@ export function LoginPage() {
             ZACMA SMS PORTAL
           </h1>
           <p className="text-slate-300 text-sm sm:text-base leading-relaxed">
-            Enterprise Bulk SMS command center for Ethiopian (+251) and international messaging.
-            Manage customer contact groups, schedule personalized campaigns, and track live SMS.io
-            delivery reports from mobile or desktop.
+            Direct Android SIM-based Bulk SMS command center for Ethiopian (+251) and international
+            messaging. Pair your mobile phone via QR code, select Dual SIM lines, manage contact
+            groups, and track live delivery receipts with zero third-party gateway fees.
           </p>
 
           <div className="pt-4 border-t border-slate-800 grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs text-slate-300">
             <div>
-              <p className="font-semibold text-white">Ethiopian +251 Ready</p>
-              <p className="text-slate-400 mt-0.5">Ethio Telecom, Safaricom & global E.164</p>
+              <p className="font-semibold text-white">Direct Phone SIM</p>
+              <p className="text-slate-400 mt-0.5">Ethio Telecom, Safaricom &amp; Dual SIM support</p>
             </div>
             <div>
-              <p className="font-semibold text-white">Excel & CSV Import</p>
-              <p className="text-slate-400 mt-0.5">Auto-deduplication & group targeting</p>
+              <p className="font-semibold text-white">Excel &amp; CSV Import</p>
+              <p className="text-slate-400 mt-0.5">Auto-deduplication &amp; group targeting</p>
             </div>
             <div>
               <p className="font-semibold text-white">Role-Based Access</p>
-              <p className="text-slate-400 mt-0.5">Admin controls & immutable audit trail</p>
+              <p className="text-slate-400 mt-0.5">Admin controls &amp; immutable audit trail</p>
             </div>
           </div>
         </div>
 
         <p className="text-xs text-slate-500">
-          © {new Date().getFullYear()} ZACMA Technology · Powered by SMS.io API
+          © {new Date().getFullYear()} ZACMA Technology · Direct Android SIM Bulk SMS
         </p>
       </div>
 
@@ -430,7 +430,7 @@ export function LoginPage() {
             <ShieldCheck className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
             <p className="leading-relaxed">
               Protected by Firebase Authentication, persistent local sessions, role-based Firestore
-              rules, and server-side SMS.io API key isolation.
+              rules, and single-use QR pairing tokens for Android SIM devices.
             </p>
           </div>
         </div>

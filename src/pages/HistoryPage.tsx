@@ -70,13 +70,13 @@ export function HistoryPage() {
         type: 'success',
         text:
           updated > 0
-            ? `Synchronized delivery reports for ${updated} messages from SMS.io.`
-            : 'No pending/sent delivery status changes returned by SMS.io.',
+            ? `Synchronized Android SIM delivery receipts for ${updated} messages.`
+            : 'No new SIM delivery receipt updates recorded yet.',
       });
     } catch (err) {
       setFeedback({
         type: 'error',
-        text: err instanceof Error ? err.message : 'Unable to sync delivery statuses.',
+        text: err instanceof Error ? err.message : 'Unable to sync SIM delivery statuses.',
       });
     } finally {
       setSyncing(false);
@@ -113,14 +113,12 @@ export function HistoryPage() {
       Recipient: tx.recipientName,
       Phone: tx.recipientPhone,
       Message: tx.messageContent,
-      SenderID: tx.senderId,
+      SimLine: tx.senderId,
       Status: tx.status,
       Segments: tx.segments,
-      Cost: tx.cost,
-      Currency: tx.currency,
-      ProviderMessageId: tx.providerMessageId,
+      SimDispatchId: tx.providerMessageId,
       HttpStatus: tx.httpStatus,
-      ApiResponse: tx.apiResponseSummary,
+      SimResponse: tx.apiResponseSummary,
     }));
     const stamp = new Date().toISOString().slice(0, 10);
     if (format === 'xlsx') {
@@ -271,8 +269,8 @@ export function HistoryPage() {
               No SMS transactions recorded
             </p>
             <p className="text-xs text-slate-500">
-              Once messages are dispatched through SMS.io, full transaction logs, segments, costs,
-              and API responses appear here.
+              Once messages are dispatched through your paired Android phone SIM card, full logs,
+              segments, and delivery receipts appear here.
             </p>
           </div>
         ) : (
@@ -281,13 +279,13 @@ export function HistoryPage() {
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-xs font-semibold text-slate-600">
-                    <th className="py-3 px-4">Date & Time</th>
+                    <th className="py-3 px-4">Date &amp; Time</th>
                     <th className="py-3 px-4">Recipient</th>
                     <th className="py-3 px-4">Campaign</th>
                     <th className="py-3 px-4">Message</th>
                     <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">SIM Line</th>
                     <th className="py-3 px-4 text-right">Segments</th>
-                    <th className="py-3 px-4 text-right">Cost</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
@@ -317,11 +315,11 @@ export function HistoryPage() {
                       <td className={`py-3 px-4 text-xs capitalize ${statusTextStyle(tx.status)}`}>
                         {tx.status}
                       </td>
+                      <td className="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">
+                        {tx.senderId || 'ANDROID-SIM'}
+                      </td>
                       <td className="py-3 px-4 font-mono tabular-nums text-xs text-right text-slate-700">
                         {tx.segments}
-                      </td>
-                      <td className="py-3 px-4 font-mono tabular-nums text-xs text-right text-slate-800 whitespace-nowrap">
-                        {tx.cost > 0 ? `${tx.currency} ${tx.cost.toFixed(4)}` : '—'}
                       </td>
                     </tr>
                   ))}
@@ -400,17 +398,17 @@ export function HistoryPage() {
                 <dd className="font-semibold text-slate-800 mt-0.5">{selectedTx.campaignName}</dd>
               </div>
               <div>
-                <dt className="text-slate-500">Sender ID</dt>
+                <dt className="text-slate-500">SIM Line / Number</dt>
                 <dd className="font-mono text-slate-800 mt-0.5">{selectedTx.senderId}</dd>
               </div>
               <div>
-                <dt className="text-slate-500">Segments & Cost</dt>
+                <dt className="text-slate-500">SIM Segments</dt>
                 <dd className="font-mono text-slate-800 mt-0.5">
-                  {selectedTx.segments} seg · {selectedTx.currency} {selectedTx.cost.toFixed(4)}
+                  {selectedTx.segments} {selectedTx.segments === 1 ? 'segment' : 'segments'} (Carrier SIM)
                 </dd>
               </div>
               <div>
-                <dt className="text-slate-500">Provider Message ID</dt>
+                <dt className="text-slate-500">SIM Dispatch ID</dt>
                 <dd className="font-mono text-slate-800 mt-0.5 break-all">
                   {selectedTx.providerMessageId || '—'}
                 </dd>
@@ -425,9 +423,9 @@ export function HistoryPage() {
             </div>
 
             <div className="space-y-1">
-              <p className="text-xs font-semibold text-slate-700">SMS.io API Response</p>
+              <p className="text-xs font-semibold text-slate-700">Android SIM Bridge Response</p>
               <pre className="text-[11px] font-mono bg-slate-950 text-slate-200 rounded-xl p-3.5 overflow-x-auto whitespace-pre-wrap break-all">
-                {selectedTx.apiResponseSummary || 'No response body recorded.'}
+                {selectedTx.apiResponseSummary || 'No device response recorded.'}
               </pre>
             </div>
 

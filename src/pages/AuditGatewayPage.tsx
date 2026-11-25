@@ -1,12 +1,11 @@
 import { useMemo, useState } from 'react';
-import { RefreshCw, Search, ShieldCheck, Server, Globe } from 'lucide-react';
+import { RefreshCw, Search, ShieldCheck, Smartphone, Globe } from 'lucide-react';
 import { usePortalData } from '../context/PortalDataContext';
 import { FIREBASE_AUTH_SETTINGS } from '../lib/firebase';
 import { formatTimestamp } from '../lib/smsUtils';
 
 export function AuditGatewayPage() {
-  const { auditLogs, gatewayConfig, gatewayBalance, balanceLoading, refreshGatewayInfo } =
-    usePortalData();
+  const { auditLogs, simBridgeStatus, bridgeLoading, refreshSimBridgeStatus } = usePortalData();
   const [searchQuery, setSearchQuery] = useState('');
 
   const filteredLogs = useMemo(() => {
@@ -23,63 +22,63 @@ export function AuditGatewayPage() {
 
   return (
     <div className="space-y-6">
-      {/* SMS.io Server-Side Gateway Diagnostics */}
+      {/* Android SIM Bridge Diagnostics */}
       <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
-              <Server className="w-5 h-5" />
+              <Smartphone className="w-5 h-5" />
             </div>
             <div>
               <h2 className="font-display text-base font-bold text-slate-900">
-                SMS.io Server Gateway Configuration
+                Android SIM Bridge Configuration
               </h2>
               <p className="text-xs text-slate-500">
-                API credentials are stored exclusively in server environment variables
+                Direct SIM card dispatch via WebSocket — zero third-party SMS gateways or API keys
               </p>
             </div>
           </div>
 
           <button
             type="button"
-            disabled={balanceLoading}
-            onClick={() => void refreshGatewayInfo()}
+            disabled={bridgeLoading}
+            onClick={() => void refreshSimBridgeStatus()}
             className="min-h-[42px] inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 px-4 cursor-pointer disabled:opacity-50 whitespace-nowrap"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${balanceLoading ? 'animate-spin' : ''}`} />
-            Test Gateway & Balance
+            <RefreshCw className={`w-3.5 h-3.5 ${bridgeLoading ? 'animate-spin' : ''}`} />
+            Refresh SIM Bridge
           </button>
         </div>
 
         <dl className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2 border-t border-slate-100 text-xs">
           <div>
-            <dt className="text-slate-500">SMS_IO_API_KEY</dt>
+            <dt className="text-slate-500">Bridge Status</dt>
             <dd
               className={`font-semibold mt-1 ${
-                gatewayConfig?.configured ? 'text-emerald-700' : 'text-red-600'
+                simBridgeStatus?.simBridgeReady ? 'text-emerald-700' : 'text-amber-700'
               }`}
             >
-              {gatewayConfig?.configured ? 'Configured on Server' : 'Not Configured'}
+              {simBridgeStatus?.simBridgeReady
+                ? `Online (${simBridgeStatus.onlineDevicesCount} handset${simBridgeStatus.onlineDevicesCount === 1 ? '' : 's'})`
+                : 'Awaiting Android Pairing'}
             </dd>
           </div>
           <div>
-            <dt className="text-slate-500">Default Sender ID</dt>
+            <dt className="text-slate-500">WebSocket Bridge</dt>
             <dd className="font-mono font-semibold text-slate-900 mt-1">
-              {gatewayConfig?.senderId || 'ZACMA'}
+              {simBridgeStatus?.wsEndpoint || '/ws/mobile-bridge'}
             </dd>
           </div>
           <div>
-            <dt className="text-slate-500">SMS API Endpoint</dt>
-            <dd className="font-mono text-slate-800 mt-1 break-all">
-              {gatewayConfig?.apiBaseUrl || 'https://api.sms.to'}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-slate-500">Live Account Balance</dt>
+            <dt className="text-slate-500">Linked Handsets</dt>
             <dd className="font-mono font-semibold text-slate-900 mt-1">
-              {gatewayBalance?.balance !== null && gatewayBalance?.balance !== undefined
-                ? `${gatewayBalance.currency} ${gatewayBalance.balance.toFixed(2)}`
-                : gatewayBalance?.error || 'Unavailable'}
+              {simBridgeStatus?.linkedDevicesCount ?? 0} linked · Dual SIM ready
+            </dd>
+          </div>
+          <div>
+            <dt className="text-slate-500">External Paid Gateway</dt>
+            <dd className="font-semibold text-emerald-700 mt-1">
+              None (Direct SIM Billing Only)
             </dd>
           </div>
         </dl>
@@ -87,11 +86,11 @@ export function AuditGatewayPage() {
         <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-600 space-y-1.5">
           <div className="flex items-center gap-2 font-semibold text-slate-800">
             <ShieldCheck className="w-4 h-4 text-blue-700" />
-            <span>Official SMS.io / SMS.to Server Routes in Use</span>
+            <span>Active Android SIM Bridge Endpoints</span>
           </div>
           <p className="font-mono text-[11px] text-slate-600">
-            Send: POST /sms/send · Estimate: POST /sms/estimate · Balance: GET /api/balance ·
-            Status: GET /message/:id &amp; GET /v2/messages · DLR Webhook: POST /api/sms/webhook
+            WebSocket: /ws/mobile-bridge · Pairing: POST /api/mobile-device/pairing-session ·
+            Dispatch: POST /api/sms/send · Delivery Receipts: POST /api/sms/status
           </p>
         </div>
       </section>
@@ -107,7 +106,7 @@ export function AuditGatewayPage() {
               Firebase Authentication &amp; Authorized Domains
             </h2>
             <p className="text-xs text-slate-500">
-              Ensure your Vercel production, preview, and custom domains are listed in Firebase
+              Ensure your production, preview, and custom domains are listed in Firebase
               Console → Authentication → Settings → Authorized domains
             </p>
           </div>
@@ -147,10 +146,10 @@ export function AuditGatewayPage() {
         <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="font-display text-base font-bold text-slate-900">
-              Immutable Security & Activity Audit Log
+              Immutable Security &amp; Activity Audit Log
             </h2>
             <p className="text-xs text-slate-500">
-              Append-only log of sign-ins, bulk SMS dispatches, retries, imports, and RBAC changes
+              Append-only log of sign-ins, bulk SIM dispatches, retries, imports, and RBAC changes
             </p>
           </div>
 

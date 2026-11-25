@@ -38,7 +38,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'campaigns', label: 'Campaigns', shortLabel: 'Campaigns', icon: Megaphone },
   { id: 'history', label: 'SMS History & Reports', shortLabel: 'History', icon: FileText },
   { id: 'staff', label: 'Staff & Roles', shortLabel: 'Staff', icon: ShieldCheck, adminOnly: true },
-  { id: 'audit', label: 'Audit Log & Gateway', shortLabel: 'Audit', icon: History },
+  { id: 'audit', label: 'Audit Log & SIM Bridge', shortLabel: 'Audit', icon: History },
 ];
 
 const TAB_TITLES: Record<PortalTab, string> = {
@@ -48,7 +48,7 @@ const TAB_TITLES: Record<PortalTab, string> = {
   campaigns: 'Campaign Management',
   history: 'SMS History & Reports',
   staff: 'Staff Accounts & Roles',
-  audit: 'Audit Log & Gateway',
+  audit: 'Audit Log & SIM Bridge',
 };
 
 export function Layout({ activeTab, onSelectTab, children }: LayoutProps) {

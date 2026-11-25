@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { WebSocketServer, WebSocket, type RawData } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,43 +48,10 @@ try {
   console.error('Failed to read firebase-applet-config.json:', err);
 }
 
-// Official Google Firebase public JWKS for RS256 ID token verification (no IAM required)
+// Official Google Firebase public JWKS for RS256 ID token verification
 const FIREBASE_JWKS = createRemoteJWKSet(
   new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com')
 );
-
-// SSRF-safe base URL validator for SMS.io / SMS.to endpoints
-function validateGatewayBaseUrl(rawUrl: string | undefined, fallback: string): string {
-  const candidate = (rawUrl || fallback).trim().replace(/\/+$/, '');
-  try {
-    const parsed = new URL(candidate);
-    if (parsed.protocol !== 'https:') {
-      throw new Error('Gateway URL must use HTTPS');
-    }
-    const host = parsed.hostname.toLowerCase();
-    const blocked =
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host === '::1' ||
-      host === '0.0.0.0' ||
-      host.startsWith('10.') ||
-      host.startsWith('192.168.') ||
-      host.startsWith('169.254.') ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
-      host.endsWith('.local') ||
-      host.endsWith('.internal');
-    if (blocked) {
-      throw new Error('Blocked private gateway host');
-    }
-    return parsed.origin;
-  } catch {
-    return fallback;
-  }
-}
-
-const SMS_API_BASE = validateGatewayBaseUrl(process.env.SMS_IO_API_BASE_URL, 'https://api.sms.to');
-const SMS_AUTH_BASE = validateGatewayBaseUrl(process.env.SMS_IO_AUTH_BASE_URL, 'https://auth.sms.to');
-const DEFAULT_SENDER_ID = (process.env.SMS_IO_SENDER_ID || 'ZACMA').trim().slice(0, 11) || 'ZACMA';
 
 const E164_REGEX = /^\+[1-9][0-9]{6,14}$/;
 const SENDER_ID_REGEX = /^[a-zA-Z0-9 +\-_.]{1,15}$/;
@@ -115,24 +84,313 @@ interface SendResultPayload {
   httpStatus: number;
   apiResponseSummary: string;
   deduplicated: boolean;
+  simSender?: string;
 }
 
-interface WebhookDlrRecord {
+interface SimDlrRecord {
   messageId: string;
   status: 'sent' | 'pending' | 'delivered' | 'failed' | 'rejected';
-  cost?: number;
   parts?: number;
   rawSummary: string;
   updatedAt: number;
 }
 
-// Bounded in-memory idempotency cache (prevents duplicate sends on network retries)
+// Bounded in-memory idempotency cache (prevents duplicate SMS sends on network retries)
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const idempotencyCache = new Map<string, CachedDispatch>();
 const inFlightKeys = new Set<string>();
 
-// Bounded in-memory webhook DLR store (populated by POST /api/sms/webhook)
-const webhookDlrCache = new Map<string, WebhookDlrRecord>();
+// Bounded in-memory delivery receipt cache (populated by Android companion sms:dlr WebSocket frames)
+const simDlrCache = new Map<string, SimDlrRecord>();
+
+type SimSlotPreference = 'auto' | 'sim1' | 'sim2';
+
+interface PairingSessionRecord {
+  pairingCode: string;
+  shortPin: string;
+  simSlot: SimSlotPreference;
+  createdByUid: string;
+  createdByEmail: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  used: boolean;
+}
+
+interface LinkedDeviceRecord {
+  id: string;
+  deviceTokenHash: string;
+  deviceName: string;
+  androidVersion: string;
+  phoneNumber: string;
+  carrierName: string;
+  simSlot: SimSlotPreference;
+  dualSimSupported: boolean;
+  connectedAtMs: number;
+  lastSeenAtMs: number;
+  linkedByEmail: string;
+}
+
+const PAIRING_TTL_MS = 10 * 60 * 1000;
+const SIM_DISPATCH_TIMEOUT_MS = 25 * 1000;
+const WS_MOBILE_BRIDGE_PATH = '/ws/mobile-bridge';
+const pairingSessions = new Map<string, PairingSessionRecord>();
+const linkedDevices = new Map<string, LinkedDeviceRecord>();
+const dashboardSockets = new Set<WebSocket>();
+const deviceSockets = new Map<string, WebSocket>();
+
+interface PendingSimJob {
+  deviceId: string;
+  resolve: (result: {
+    success: boolean;
+    status: 'sent' | 'delivered' | 'failed' | 'rejected';
+    detail: string;
+  }) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingSimJobs = new Map<string, PendingSimJob>();
+
+function getOnlineLinkedDevice(preferredDeviceId?: string): {
+  record: LinkedDeviceRecord;
+  socket: WebSocket;
+} | null {
+  if (preferredDeviceId) {
+    const rec = linkedDevices.get(preferredDeviceId);
+    const sock = deviceSockets.get(preferredDeviceId);
+    if (rec && sock && sock.readyState === WebSocket.OPEN) {
+      return { record: rec, socket: sock };
+    }
+    return null;
+  }
+  for (const [devId, sock] of deviceSockets.entries()) {
+    if (sock.readyState === WebSocket.OPEN) {
+      const rec = linkedDevices.get(devId);
+      if (rec) return { record: rec, socket: sock };
+    }
+  }
+  return null;
+}
+
+function getOnlineDevicesCount(): number {
+  let count = 0;
+  for (const [devId, sock] of deviceSockets.entries()) {
+    if (sock.readyState === WebSocket.OPEN && linkedDevices.has(devId)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function sanitizeSimSenderLabel(raw: string): string {
+  const cleaned = raw.replace(/[^a-zA-Z0-9 +\-_.]/g, '').trim().slice(0, 15);
+  return cleaned || 'ANDROID-SIM';
+}
+
+function dispatchViaAndroidSim(params: {
+  device: { record: LinkedDeviceRecord; socket: WebSocket };
+  to: string;
+  message: string;
+  simSlotOverride?: SimSlotPreference;
+  idempotencyKey: string;
+  segments: number;
+}): Promise<SendResultPayload> {
+  const { record, socket } = params.device;
+  const effectiveSimSlot = params.simSlotOverride || record.simSlot;
+  const jobId = `sim_${crypto.randomBytes(8).toString('hex')}`;
+  const simSender = sanitizeSimSenderLabel(
+    record.phoneNumber && record.phoneNumber !== 'SIM Primary'
+      ? record.phoneNumber
+      : effectiveSimSlot === 'sim1'
+        ? 'SIM-1'
+        : effectiveSimSlot === 'sim2'
+          ? 'SIM-2'
+          : 'ANDROID-SIM'
+  );
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingSimJobs.delete(jobId);
+      resolve({
+        success: false,
+        status: 'failed',
+        messageId: jobId,
+        cost: 0,
+        currency: 'SIM',
+        segments: params.segments,
+        httpStatus: 504,
+        apiResponseSummary: `Timed out waiting for Android device "${record.deviceName}" (${effectiveSimSlot.toUpperCase()}) to confirm SIM SMS dispatch.`,
+        deduplicated: false,
+        simSender,
+      });
+    }, SIM_DISPATCH_TIMEOUT_MS);
+
+    pendingSimJobs.set(jobId, {
+      deviceId: record.id,
+      timer,
+      resolve: (outcome) => {
+        resolve({
+          success: outcome.success,
+          status: outcome.status,
+          messageId: jobId,
+          cost: 0,
+          currency: 'SIM',
+          segments: params.segments,
+          httpStatus: outcome.success ? 200 : 502,
+          apiResponseSummary: outcome.detail.slice(0, 950),
+          deduplicated: false,
+          simSender,
+        });
+      },
+    });
+
+    try {
+      socket.send(
+        JSON.stringify({
+          type: 'sms:dispatch',
+          jobId,
+          to: params.to,
+          message: params.message,
+          simSlot: effectiveSimSlot,
+          idempotencyKey: params.idempotencyKey,
+        })
+      );
+    } catch (err) {
+      clearTimeout(timer);
+      pendingSimJobs.delete(jobId);
+      resolve({
+        success: false,
+        status: 'failed',
+        messageId: jobId,
+        cost: 0,
+        currency: 'SIM',
+        segments: params.segments,
+        httpStatus: 502,
+        apiResponseSummary:
+          err instanceof Error
+            ? `WebSocket write failed for "${record.deviceName}": ${err.message}`
+            : 'WebSocket write failed for Android device.',
+        deduplicated: false,
+        simSender,
+      });
+    }
+  });
+}
+
+function normalizeSimSlot(raw: unknown): SimSlotPreference {
+  if (raw === 'sim1' || raw === 'sim2' || raw === 'auto') return raw;
+  return 'auto';
+}
+
+function hashDeviceToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function verifyDeviceTokenHash(token: string, expectedHash: string): boolean {
+  const actual = Buffer.from(hashDeviceToken(token), 'hex');
+  const expected = Buffer.from(expectedHash, 'hex');
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function prunePairingSessions(): void {
+  const now = Date.now();
+  for (const [code, session] of pairingSessions.entries()) {
+    if (session.used || now > session.expiresAtMs) {
+      pairingSessions.delete(code);
+    }
+  }
+}
+
+function serializeDevice(d: LinkedDeviceRecord) {
+  const sock = deviceSockets.get(d.id);
+  const online = Boolean(sock && sock.readyState === WebSocket.OPEN);
+  return {
+    id: d.id,
+    deviceName: d.deviceName,
+    androidVersion: d.androidVersion,
+    phoneNumber: d.phoneNumber,
+    carrierName: d.carrierName,
+    simSlot: d.simSlot,
+    dualSimSupported: d.dualSimSupported,
+    online,
+    connectedAt: new Date(d.connectedAtMs).toISOString(),
+    lastSeenAt: new Date(d.lastSeenAtMs).toISOString(),
+    linkedByEmail: d.linkedByEmail,
+  };
+}
+
+function broadcastToDashboards(payload: Record<string, unknown>): void {
+  const serialized = JSON.stringify(payload);
+  for (const ws of dashboardSockets) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(serialized);
+    } else {
+      dashboardSockets.delete(ws);
+    }
+  }
+}
+
+function completeDevicePairing(body: {
+  pairingCode?: unknown;
+  deviceName?: unknown;
+  androidVersion?: unknown;
+  phoneNumber?: unknown;
+  carrierName?: unknown;
+  simSlot?: unknown;
+  dualSimSupported?: unknown;
+}):
+  | { ok: true; deviceToken: string; deviceRecord: LinkedDeviceRecord }
+  | { ok: false; status: number; error: string } {
+  prunePairingSessions();
+  const rawCode = typeof body.pairingCode === 'string' ? body.pairingCode.trim() : '';
+  if (!rawCode || rawCode.length > 128) {
+    return { ok: false, status: 400, error: 'Valid pairingCode from QR scan is required.' };
+  }
+
+  const session = pairingSessions.get(rawCode);
+  if (!session || session.used || Date.now() > session.expiresAtMs) {
+    return {
+      ok: false,
+      status: 401,
+      error: 'Pairing QR code has expired or was already used. Generate a new QR code.',
+    };
+  }
+
+  session.used = true;
+  pairingSessions.delete(rawCode);
+
+  const deviceId = `dev_${crypto.randomBytes(8).toString('hex')}`;
+  const deviceToken = crypto.randomBytes(32).toString('base64url');
+  const now = Date.now();
+
+  const deviceRecord: LinkedDeviceRecord = {
+    id: deviceId,
+    deviceTokenHash: hashDeviceToken(deviceToken),
+    deviceName: (typeof body.deviceName === 'string' && body.deviceName.trim()
+      ? body.deviceName.trim()
+      : 'Android Phone'
+    ).slice(0, 80),
+    androidVersion: (typeof body.androidVersion === 'string' && body.androidVersion.trim()
+      ? body.androidVersion.trim()
+      : 'Android'
+    ).slice(0, 32),
+    phoneNumber: (typeof body.phoneNumber === 'string' && body.phoneNumber.trim()
+      ? body.phoneNumber.trim()
+      : 'SIM Primary'
+    ).slice(0, 32),
+    carrierName: (typeof body.carrierName === 'string' && body.carrierName.trim()
+      ? body.carrierName.trim()
+      : 'Mobile Carrier'
+    ).slice(0, 60),
+    simSlot: normalizeSimSlot(body.simSlot ?? session.simSlot),
+    dualSimSupported: body.dualSimSupported === true,
+    connectedAtMs: now,
+    lastSeenAtMs: now,
+    linkedByEmail: session.createdByEmail,
+  };
+
+  linkedDevices.set(deviceId, deviceRecord);
+  return { ok: true, deviceToken, deviceRecord };
+}
 
 function pruneCaches(): void {
   const now = Date.now();
@@ -143,17 +401,14 @@ function pruneCaches(): void {
       }
     }
   }
-  if (webhookDlrCache.size > 5000) {
-    for (const [k, v] of webhookDlrCache.entries()) {
-      if (now - v.updatedAt > IDEMPOTENCY_TTL_MS || webhookDlrCache.size > 4000) {
-        webhookDlrCache.delete(k);
+  if (simDlrCache.size > 5000) {
+    for (const [k, v] of simDlrCache.entries()) {
+      if (now - v.updatedAt > IDEMPOTENCY_TTL_MS || simDlrCache.size > 4000) {
+        simDlrCache.delete(k);
       }
     }
   }
-}
-
-function getSmsApiKey(): string {
-  return (process.env.SMS_IO_API_KEY || '').trim();
+  prunePairingSessions();
 }
 
 function emailToStaffKey(email: string): string {
@@ -218,12 +473,12 @@ async function verifyPortalRbacFromFirestore(
   return { authorized: false, role: 'staff', canSendBulk: false };
 }
 
-function normalizeProviderStatus(rawStatus: unknown): 'pending' | 'sent' | 'delivered' | 'failed' | 'rejected' {
+function normalizeSimStatus(rawStatus: unknown): 'pending' | 'sent' | 'delivered' | 'failed' | 'rejected' {
   const s = String(rawStatus || '').trim().toUpperCase();
   if (s === 'DELIVERED' || s === 'DELIVRD' || s === 'SUCCESS' || s === 'COMPLETED') return 'delivered';
   if (s === 'SENT' || s === 'SUBMITTED' || s === 'DISPATCHED') return 'sent';
   if (s === 'QUEUED' || s === 'PENDING' || s === 'ACCEPTED' || s === 'ONGOING' || s === 'SCHEDULED') return 'pending';
-  if (s === 'REJECTED' || s === 'UNDELIV' || s === 'EXPIRED' || s === 'NO_FUNDS' || s === 'BLACKLISTED') return 'rejected';
+  if (s === 'REJECTED' || s === 'UNDELIV' || s === 'EXPIRED' || s === 'NO_FUNDS' || s === 'RADIO_OFF') return 'rejected';
   if (s === 'FAILED' || s === 'ERROR') return 'failed';
   return 'pending';
 }
@@ -239,95 +494,12 @@ function calculateSegmentsServer(message: string): number {
   return len <= 70 ? 1 : Math.ceil(len / 67);
 }
 
-function safeSummarizeResponse(data: unknown, fallbackText: string): string {
-  try {
-    const str = typeof data === 'string' ? data : JSON.stringify(data);
-    return (str || fallbackText).slice(0, 950);
-  } catch {
-    return fallbackText.slice(0, 950);
-  }
-}
-
-// Fetch wrapper with timeout & safe exponential backoff retries (ONLY on network errors, 429, or 5xx)
-async function fetchWithTimeoutAndRetry(
-  url: string,
-  options: RequestInit,
-  maxRetries = 2,
-  timeoutMs = 15000
-): Promise<{ ok: boolean; status: number; data: unknown; text: string }> {
-  let attempt = 0;
-  let lastError: unknown = null;
-
-  while (attempt <= maxRetries) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const response = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-
-      const text = await response.text();
-      let data: unknown = text;
-      try {
-        data = text ? JSON.parse(text) : {};
-      } catch {
-        data = { raw: text };
-      }
-
-      if ((response.status === 429 || response.status >= 500) && attempt < maxRetries) {
-        const delayMs = 600 * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, delayMs));
-        attempt += 1;
-        continue;
-      }
-
-      return { ok: response.ok, status: response.status, data, text };
-    } catch (err) {
-      clearTimeout(timer);
-      lastError = err;
-      if (attempt < maxRetries) {
-        const delayMs = 600 * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, delayMs));
-        attempt += 1;
-        continue;
-      }
-    }
-  }
-
-  const message =
-    lastError instanceof Error && lastError.name === 'AbortError'
-      ? 'SMS.io API request timed out after 15 seconds'
-      : lastError instanceof Error
-        ? `Network error contacting SMS.io: ${lastError.message}`
-        : 'Network error contacting SMS.io gateway';
-
-  return {
-    ok: false,
-    status: 504,
-    data: { error: message },
-    text: message,
-  };
-}
-
-// Firebase Auth + RBAC middleware for all protected /api/sms/* endpoints
-async function requireFirebaseAuth(
-  req: AuthenticatedRequest,
-  res: express.Response,
-  next: express.NextFunction
-): Promise<void> {
-  const authHeader = req.headers.authorization || '';
-  if (!authHeader.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Authentication required. Missing Bearer token.' });
-    return;
-  }
-
-  const token = authHeader.slice(7).trim();
+// Shared Firebase ID token + Firestore RBAC verification for REST and WebSocket endpoints
+async function verifyFirebaseTokenWithRbac(
+  token: string
+): Promise<{ ok: true; user: VerifiedUser } | { ok: false; status: number; error: string }> {
   if (!token || !FIREBASE_PROJECT_ID) {
-    res.status(401).json({ error: 'Authentication configuration invalid.' });
-    return;
+    return { ok: false, status: 401, error: 'Authentication configuration invalid.' };
   }
 
   try {
@@ -341,29 +513,58 @@ async function requireFirebaseAuth(
     const emailVerified = payload.email_verified === true;
 
     if (!uid || !email || !emailVerified) {
-      res.status(403).json({ error: 'Verified Google account email is required.' });
-      return;
+      return { ok: false, status: 403, error: 'Verified account email is required.' };
     }
 
     const rbac = await verifyPortalRbacFromFirestore(token, uid, email);
     if (!rbac.authorized) {
-      res.status(403).json({
-        error: 'Your account is not authorized to access ZACMA SMS PORTAL gateway services.',
-      });
-      return;
+      return {
+        ok: false,
+        status: 403,
+        error: 'Your account is not authorized to access ZACMA SMS PORTAL services.',
+      };
     }
 
-    req.authUser = {
-      uid,
-      email,
-      emailVerified,
-      role: rbac.role,
-      canSendBulk: rbac.canSendBulk,
+    return {
+      ok: true,
+      user: {
+        uid,
+        email,
+        emailVerified,
+        role: rbac.role,
+        canSendBulk: rbac.canSendBulk,
+      },
     };
-    next();
   } catch {
-    res.status(401).json({ error: 'Invalid or expired authentication token. Please sign in again.' });
+    return {
+      ok: false,
+      status: 401,
+      error: 'Invalid or expired authentication token. Please sign in again.',
+    };
   }
+}
+
+// Firebase Auth + RBAC middleware for all protected /api/* endpoints
+async function requireFirebaseAuth(
+  req: AuthenticatedRequest,
+  res: express.Response,
+  next: express.NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Authentication required. Missing Bearer token.' });
+    return;
+  }
+
+  const token = authHeader.slice(7).trim();
+  const verification = await verifyFirebaseTokenWithRbac(token);
+  if (!verification.ok) {
+    res.status(verification.status).json({ error: verification.error });
+    return;
+  }
+
+  req.authUser = verification.user;
+  next();
 }
 
 async function startServer(): Promise<void> {
@@ -380,163 +581,25 @@ async function startServer(): Promise<void> {
   });
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, service: 'zacma-sms-portal' });
+    res.json({ ok: true, service: 'zacma-sms-portal', transport: 'android-sim-bridge' });
   });
 
+  // Android SIM Bridge live status (replaces all third-party SMS gateway configuration)
   app.get('/api/sms/config-status', requireFirebaseAuth, (_req, res) => {
-    const configured = getSmsApiKey().length > 0;
+    const devices = Array.from(linkedDevices.values())
+      .sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs)
+      .map(serializeDevice);
+    const onlineDevicesCount = getOnlineDevicesCount();
     res.json({
-      configured,
-      senderId: DEFAULT_SENDER_ID,
-      apiBaseUrl: SMS_API_BASE,
-      authBaseUrl: SMS_AUTH_BASE,
-      webhookPath: '/api/sms/webhook',
+      simBridgeReady: onlineDevicesCount > 0,
+      onlineDevicesCount,
+      linkedDevicesCount: devices.length,
+      devices,
+      wsEndpoint: WS_MOBILE_BRIDGE_PATH,
     });
   });
 
-  app.get('/api/sms/balance', requireFirebaseAuth, async (_req, res) => {
-    const apiKey = getSmsApiKey();
-    if (!apiKey) {
-      res.status(503).json({
-        configured: false,
-        error: 'SMS_IO_API_KEY is not configured in server environment variables.',
-      });
-      return;
-    }
-
-    const result = await fetchWithTimeoutAndRetry(
-      `${SMS_AUTH_BASE}/api/balance`,
-      {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-      },
-      1,
-      12000
-    );
-
-    if (!result.ok) {
-      res.status(result.status >= 400 ? result.status : 502).json({
-        configured: true,
-        error: 'Failed to retrieve SMS.io account balance.',
-        httpStatus: result.status,
-        raw: result.data,
-      });
-      return;
-    }
-
-    const obj = (typeof result.data === 'object' && result.data !== null ? result.data : {}) as Record<string, unknown>;
-    const balanceRaw = obj.balance ?? obj.credits ?? obj.amount ?? (obj.data as Record<string, unknown> | undefined)?.balance;
-    const balance = typeof balanceRaw === 'number' ? balanceRaw : Number(balanceRaw);
-    const currency = String(
-      obj.currency ?? (obj.data as Record<string, unknown> | undefined)?.currency ?? 'USD'
-    );
-
-    res.json({
-      configured: true,
-      balance: Number.isFinite(balance) ? balance : null,
-      currency,
-      httpStatus: result.status,
-      raw: result.data,
-    });
-  });
-
-  app.post('/api/sms/estimate', requireFirebaseAuth, async (req, res) => {
-    const apiKey = getSmsApiKey();
-    const body = (req.body || {}) as {
-      to?: string | string[];
-      message?: string;
-      senderId?: string;
-    };
-
-    const message = typeof body.message === 'string' ? body.message.trim() : '';
-    const senderId = (typeof body.senderId === 'string' && body.senderId.trim()
-      ? body.senderId.trim()
-      : DEFAULT_SENDER_ID
-    ).slice(0, 15);
-
-    const rawTo = Array.isArray(body.to) ? body.to : typeof body.to === 'string' ? [body.to] : [];
-    const recipients = rawTo.map((p) => String(p).trim()).filter((p) => E164_REGEX.test(p));
-
-    if (!message || message.length > 1600) {
-      res.status(400).json({ error: 'Message must be between 1 and 1600 characters.' });
-      return;
-    }
-    if (recipients.length === 0) {
-      res.status(400).json({ error: 'At least one valid E.164 phone number is required.' });
-      return;
-    }
-
-    const localSegmentsPerMessage = calculateSegmentsServer(message);
-    const localTotalSegments = localSegmentsPerMessage * recipients.length;
-
-    if (!apiKey) {
-      res.status(503).json({
-        configured: false,
-        estimatedSegments: localTotalSegments,
-        segmentsPerMessage: localSegmentsPerMessage,
-        estimatedCost: null,
-        currency: 'USD',
-        error: 'SMS_IO_API_KEY is not configured; live cost estimate unavailable.',
-      });
-      return;
-    }
-
-    const payload =
-      recipients.length === 1
-        ? { to: recipients[0], message, sender_id: senderId }
-        : { to: recipients.slice(0, 50), message, sender_id: senderId };
-
-    const result = await fetchWithTimeoutAndRetry(
-      `${SMS_API_BASE}/sms/estimate`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      },
-      1,
-      12000
-    );
-
-    if (!result.ok) {
-      res.status(result.status >= 400 ? result.status : 502).json({
-        configured: true,
-        estimatedSegments: localTotalSegments,
-        segmentsPerMessage: localSegmentsPerMessage,
-        estimatedCost: null,
-        currency: 'USD',
-        httpStatus: result.status,
-        error: 'SMS.io estimate request returned an error.',
-        raw: result.data,
-      });
-      return;
-    }
-
-    const obj = (typeof result.data === 'object' && result.data !== null ? result.data : {}) as Record<string, unknown>;
-    const rawCost =
-      obj.estimated_cost ?? obj.cost ?? obj.price ?? (obj.data as Record<string, unknown> | undefined)?.estimated_cost;
-    const sampleCost = typeof rawCost === 'number' ? rawCost : Number(rawCost);
-    const scaleFactor = recipients.length > 50 ? recipients.length / 50 : 1;
-    const estimatedCost = Number.isFinite(sampleCost) ? Number((sampleCost * scaleFactor).toFixed(4)) : null;
-
-    res.json({
-      configured: true,
-      estimatedSegments: localTotalSegments,
-      segmentsPerMessage: localSegmentsPerMessage,
-      estimatedCost,
-      currency: String(obj.currency || 'USD'),
-      httpStatus: result.status,
-      raw: result.data,
-    });
-  });
-
+  // Pure Android SIM dispatch via paired mobile phone WebSocket bridge
   app.post('/api/sms/send', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
     if (!req.authUser?.canSendBulk) {
       res.status(403).json({
@@ -554,6 +617,8 @@ async function startServer(): Promise<void> {
       to?: string;
       message?: string;
       senderId?: string;
+      deviceId?: string;
+      simSlot?: unknown;
       idempotencyKey?: string;
     };
 
@@ -561,8 +626,14 @@ async function startServer(): Promise<void> {
     const message = typeof body.message === 'string' ? body.message.trim() : '';
     const senderId = (typeof body.senderId === 'string' && body.senderId.trim()
       ? body.senderId.trim()
-      : DEFAULT_SENDER_ID
+      : 'ANDROID-SIM'
     ).slice(0, 15);
+    const requestedDeviceId =
+      typeof body.deviceId === 'string' && body.deviceId.trim() ? body.deviceId.trim() : undefined;
+    const simSlotOverride =
+      body.simSlot === 'auto' || body.simSlot === 'sim1' || body.simSlot === 'sim2'
+        ? body.simSlot
+        : undefined;
     const idempotencyKey =
       typeof body.idempotencyKey === 'string' && IDEMPOTENCY_REGEX.test(body.idempotencyKey.trim())
         ? body.idempotencyKey.trim()
@@ -591,7 +662,7 @@ async function startServer(): Promise<void> {
         success: false,
         status: 'rejected',
         httpStatus: 400,
-        error: 'Invalid Sender ID format (max 15 alphanumeric characters).',
+        error: 'Invalid SIM sender label format (max 15 characters).',
       });
       return;
     }
@@ -621,98 +692,50 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const apiKey = getSmsApiKey();
     const segments = calculateSegmentsServer(message);
+    const onlineSimDevice = getOnlineLinkedDevice(requestedDeviceId);
 
-    if (!apiKey) {
+    if (!onlineSimDevice) {
       res.status(503).json({
         success: false,
         status: 'failed',
         messageId: '',
         cost: 0,
-        currency: 'USD',
+        currency: 'SIM',
         segments,
         httpStatus: 503,
-        apiResponseSummary:
-          'SMS_IO_API_KEY is not configured in server environment variables. Configure SMS_IO_API_KEY to send live SMS messages.',
+        apiResponseSummary: requestedDeviceId
+          ? 'The selected Android phone is currently offline. Reconnect the companion app or choose another linked SIM device.'
+          : 'No Android phone is connected over the SIM WebSocket bridge. Open Dashboard -> Connect Mobile Device and scan the QR code to link your phone SIM.',
         deduplicated: false,
       });
       return;
     }
 
     inFlightKeys.add(idempotencyKey);
-
     try {
-      const appUrl = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
-      const webhookSecret = (process.env.SMS_IO_WEBHOOK_SECRET || '').trim();
-      const smsPayload: Record<string, unknown> = {
-        message,
+      const simResult = await dispatchViaAndroidSim({
+        device: onlineSimDevice,
         to,
-        sender_id: senderId,
-      };
-      if (appUrl && appUrl.startsWith('https://')) {
-        smsPayload.callback_url = webhookSecret
-          ? `${appUrl}/api/sms/webhook?secret=${encodeURIComponent(webhookSecret)}`
-          : `${appUrl}/api/sms/webhook`;
-      }
-
-      const result = await fetchWithTimeoutAndRetry(
-        `${SMS_API_BASE}/sms/send`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(smsPayload),
-        },
-        2,
-        15000
-      );
-
-      const obj = (typeof result.data === 'object' && result.data !== null ? result.data : {}) as Record<string, unknown>;
-      const providerSuccess = result.ok && obj.success !== false;
-      const providerMessageId = String(
-        obj.message_id ?? obj.trackingId ?? obj.id ?? (obj.data as Record<string, unknown> | undefined)?.message_id ?? ''
-      ).slice(0, 128);
-      const rawCost = obj.cost ?? obj.price ?? (obj.data as Record<string, unknown> | undefined)?.cost ?? 0;
-      const cost = Number.isFinite(Number(rawCost)) ? Number(rawCost) : 0;
-      const currency = String(obj.currency ?? 'USD').slice(0, 12);
-      const mappedStatus = providerSuccess
-        ? obj.status
-          ? normalizeProviderStatus(obj.status)
-          : 'sent'
-        : result.status === 422 || result.status === 400
-          ? 'rejected'
-          : 'failed';
-
-      const responsePayload: SendResultPayload = {
-        success: providerSuccess,
-        status: mappedStatus,
-        messageId: providerMessageId,
-        cost,
-        currency,
+        message,
+        simSlotOverride,
+        idempotencyKey,
         segments,
-        httpStatus: result.status,
-        apiResponseSummary: safeSummarizeResponse(result.data, result.text),
-        deduplicated: false,
-      };
-
-      if (providerSuccess || providerMessageId) {
+      });
+      if (simResult.success) {
         idempotencyCache.set(idempotencyKey, {
           timestamp: Date.now(),
-          result: responsePayload,
+          result: simResult,
         });
       }
-
-      res.status(providerSuccess ? 200 : result.status >= 400 ? result.status : 502).json(responsePayload);
+      res.status(simResult.success ? 200 : simResult.httpStatus).json(simResult);
     } finally {
       inFlightKeys.delete(idempotencyKey);
     }
   });
 
-  app.post('/api/sms/status', requireFirebaseAuth, async (req, res) => {
+  // Sync delivery receipts reported by linked Android handsets (sms:dlr WebSocket frames)
+  app.post('/api/sms/status', requireFirebaseAuth, (req, res) => {
     const body = (req.body || {}) as { messageIds?: string[] };
     const messageIds = Array.isArray(body.messageIds)
       ? body.messageIds
@@ -722,16 +745,7 @@ async function startServer(): Promise<void> {
       : [];
 
     if (messageIds.length === 0) {
-      res.status(400).json({ error: 'Provide between 1 and 25 valid provider message IDs.' });
-      return;
-    }
-
-    const apiKey = getSmsApiKey();
-    if (!apiKey) {
-      res.status(503).json({
-        configured: false,
-        error: 'SMS_IO_API_KEY is not configured in server environment variables.',
-      });
+      res.status(400).json({ error: 'Provide between 1 and 25 valid SIM dispatch IDs.' });
       return;
     }
 
@@ -739,7 +753,6 @@ async function startServer(): Promise<void> {
       string,
       {
         status: 'pending' | 'sent' | 'delivered' | 'failed' | 'rejected';
-        cost?: number;
         segments?: number;
         httpStatus: number;
         apiResponseSummary: string;
@@ -747,126 +760,420 @@ async function startServer(): Promise<void> {
     > = {};
 
     for (const msgId of messageIds) {
-      const cachedDlr = webhookDlrCache.get(msgId);
+      const cachedDlr = simDlrCache.get(msgId);
       if (cachedDlr) {
         updates[msgId] = {
           status: cachedDlr.status,
-          cost: cachedDlr.cost,
           segments: cachedDlr.parts,
           httpStatus: 200,
           apiResponseSummary: cachedDlr.rawSummary,
         };
-        continue;
-      }
-
-      const singleRes = await fetchWithTimeoutAndRetry(
-        `${SMS_API_BASE}/message/${encodeURIComponent(msgId)}`,
-        {
-          method: 'GET',
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            Accept: 'application/json',
-          },
-        },
-        1,
-        10000
-      );
-
-      if (singleRes.ok && typeof singleRes.data === 'object' && singleRes.data !== null) {
-        const obj = singleRes.data as Record<string, unknown>;
-        const nested = (obj.data as Record<string, unknown> | undefined) || obj;
-        const costVal = Number(nested.cost ?? nested.price);
-        const partsVal = Number(nested.parts ?? nested.segments);
-        updates[msgId] = {
-          status: normalizeProviderStatus(nested.status),
-          cost: Number.isFinite(costVal) ? costVal : undefined,
-          segments: Number.isFinite(partsVal) && partsVal >= 1 ? partsVal : undefined,
-          httpStatus: singleRes.status,
-          apiResponseSummary: safeSummarizeResponse(singleRes.data, singleRes.text),
-        };
-      } else {
-        const listRes = await fetchWithTimeoutAndRetry(
-          `${SMS_API_BASE}/v2/messages?limit=50`,
-          {
-            method: 'GET',
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              Accept: 'application/json',
-            },
-          },
-          0,
-          10000
-        );
-        if (listRes.ok && typeof listRes.data === 'object' && listRes.data !== null) {
-          const listObj = listRes.data as Record<string, unknown>;
-          const items = Array.isArray(listObj.data)
-            ? listObj.data
-            : Array.isArray(listObj.messages)
-              ? listObj.messages
-              : [];
-          const found = items.find((item) => {
-            if (typeof item !== 'object' || item === null) return false;
-            const rec = item as Record<string, unknown>;
-            return String(rec.id || rec.message_id || rec.trackingId || '') === msgId;
-          }) as Record<string, unknown> | undefined;
-
-          if (found) {
-            const costVal = Number(found.cost ?? found.price);
-            const partsVal = Number(found.parts ?? found.segments);
-            updates[msgId] = {
-              status: normalizeProviderStatus(found.status),
-              cost: Number.isFinite(costVal) ? costVal : undefined,
-              segments: Number.isFinite(partsVal) && partsVal >= 1 ? partsVal : undefined,
-              httpStatus: listRes.status,
-              apiResponseSummary: safeSummarizeResponse(found, ''),
-            };
-          }
-        }
       }
     }
 
     res.json({ updates });
   });
 
-  app.post('/api/sms/webhook', (req, res) => {
-    const expectedSecret = (process.env.SMS_IO_WEBHOOK_SECRET || '').trim();
-    if (expectedSecret) {
-      const provided = String(req.headers['x-webhook-secret'] || req.query.secret || '');
-      const a = Buffer.from(provided);
-      const b = Buffer.from(expectedSecret);
-      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-        res.status(401).json({ error: 'Invalid webhook secret.' });
-        return;
+  // Mobile Android SIM Bridge pairing & device management routes
+  app.get('/api/mobile-device/status', requireFirebaseAuth, (req: AuthenticatedRequest, res) => {
+    prunePairingSessions();
+    const uid = req.authUser?.uid || '';
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const serverUrl = host ? `${forwardedProto}://${host}` : '';
+
+    let latestSession: PairingSessionRecord | null = null;
+    for (const session of pairingSessions.values()) {
+      if (session.createdByUid === uid && !session.used && Date.now() < session.expiresAtMs) {
+        if (!latestSession || session.createdAtMs > latestSession.createdAtMs) {
+          latestSession = session;
+        }
       }
     }
 
-    const payload = (req.body || {}) as Record<string, unknown>;
-    const msgId = String(payload.messageId || payload.message_id || payload.trackingId || payload.id || '').trim();
-    if (!msgId || msgId.length > 128) {
-      res.status(400).json({ error: 'Missing messageId in delivery report.' });
+    const devices = Array.from(linkedDevices.values())
+      .sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs)
+      .map(serializeDevice);
+
+    res.json({
+      devices,
+      activeSession: latestSession
+        ? {
+            pairingCode: latestSession.pairingCode,
+            shortPin: latestSession.shortPin,
+            simSlot: latestSession.simSlot,
+            serverUrl,
+            pairEndpoint: '/api/mobile-device/pair',
+            wsEndpoint: WS_MOBILE_BRIDGE_PATH,
+            createdAt: new Date(latestSession.createdAtMs).toISOString(),
+            expiresAt: new Date(latestSession.expiresAtMs).toISOString(),
+          }
+        : null,
+    });
+  });
+
+  app.post('/api/mobile-device/pairing-session', requireFirebaseAuth, (req: AuthenticatedRequest, res) => {
+    prunePairingSessions();
+    const uid = req.authUser?.uid || '';
+    const email = req.authUser?.email || '';
+    const body = (req.body || {}) as { simSlot?: unknown };
+    const simSlot = normalizeSimSlot(body.simSlot);
+
+    // Revoke previous unused pairing sessions created by this user
+    for (const [code, existing] of pairingSessions.entries()) {
+      if (existing.createdByUid === uid) {
+        pairingSessions.delete(code);
+      }
+    }
+
+    const pairingCode = crypto.randomBytes(24).toString('base64url');
+    const pinDigits = crypto.randomInt(100000, 999999);
+    const shortPin = `ZCM-${pinDigits}`;
+    const now = Date.now();
+    const expiresAtMs = now + PAIRING_TTL_MS;
+
+    pairingSessions.set(pairingCode, {
+      pairingCode,
+      shortPin,
+      simSlot,
+      createdByUid: uid,
+      createdByEmail: email,
+      createdAtMs: now,
+      expiresAtMs,
+      used: false,
+    });
+
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const serverUrl = host ? `${forwardedProto}://${host}` : '';
+
+    res.json({
+      pairingCode,
+      shortPin,
+      simSlot,
+      serverUrl,
+      pairEndpoint: '/api/mobile-device/pair',
+      wsEndpoint: WS_MOBILE_BRIDGE_PATH,
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  });
+
+  // REST fallback handshake endpoint for Android companion app
+  app.post('/api/mobile-device/pair', (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
+    const paired = completeDevicePairing(body);
+    if (!paired.ok) {
+      res.status(paired.status).json({ error: paired.error });
       return;
     }
 
-    pruneCaches();
-    const costNum = Number(payload.price ?? payload.cost);
-    const partsNum = Number(payload.parts ?? payload.segments);
+    const serialized = serializeDevice(paired.deviceRecord);
+    broadcastToDashboards({ type: 'device:linked', device: serialized });
 
-    webhookDlrCache.set(msgId, {
-      messageId: msgId,
-      status: normalizeProviderStatus(payload.status),
-      cost: Number.isFinite(costNum) ? costNum : undefined,
-      parts: Number.isFinite(partsNum) && partsNum >= 1 ? partsNum : undefined,
-      rawSummary: safeSummarizeResponse(payload, 'Webhook DLR received'),
-      updatedAt: Date.now(),
+    res.json({
+      paired: true,
+      deviceToken: paired.deviceToken,
+      wsEndpoint: WS_MOBILE_BRIDGE_PATH,
+      device: serialized,
+    });
+  });
+
+  app.patch('/api/mobile-device/:deviceId/sim', requireFirebaseAuth, (req, res) => {
+    const deviceId = String(req.params.deviceId || '').trim();
+    const record = linkedDevices.get(deviceId);
+    if (!record) {
+      res.status(404).json({ error: 'Linked mobile device not found.' });
+      return;
+    }
+    const body = (req.body || {}) as { simSlot?: unknown };
+    record.simSlot = normalizeSimSlot(body.simSlot);
+    record.lastSeenAtMs = Date.now();
+    const serialized = serializeDevice(record);
+
+    const activeDeviceSock = deviceSockets.get(deviceId);
+    if (activeDeviceSock && activeDeviceSock.readyState === WebSocket.OPEN) {
+      activeDeviceSock.send(JSON.stringify({ type: 'sim:config', simSlot: record.simSlot }));
+    }
+    broadcastToDashboards({ type: 'device:updated', device: serialized });
+
+    res.json({ device: serialized });
+  });
+
+  app.post('/api/mobile-device/:deviceId/test-sms', requireFirebaseAuth, async (req: AuthenticatedRequest, res) => {
+    if (!req.authUser?.canSendBulk) {
+      res.status(403).json({ error: 'Your account does not have permission to send SMS messages.' });
+      return;
+    }
+    const deviceId = String(req.params.deviceId || '').trim();
+    const onlineDevice = getOnlineLinkedDevice(deviceId);
+    if (!onlineDevice) {
+      res.status(409).json({
+        error: 'Selected Android device is not currently online over the WebSocket bridge.',
+      });
+      return;
+    }
+    const body = (req.body || {}) as { to?: string; message?: string };
+    const to = typeof body.to === 'string' ? body.to.trim() : '';
+    const message = typeof body.message === 'string' ? body.message.trim() : '';
+
+    if (!E164_REGEX.test(to)) {
+      res.status(400).json({ error: 'Enter a valid E.164 phone number (e.g. +251911223344).' });
+      return;
+    }
+    if (!message || message.length > 1600) {
+      res.status(400).json({ error: 'Test message must be between 1 and 1600 characters.' });
+      return;
+    }
+
+    const segments = calculateSegmentsServer(message);
+    const idempotencyKey = `test_${deviceId}_${Date.now()}`;
+    const result = await dispatchViaAndroidSim({
+      device: onlineDevice,
+      to,
+      message,
+      idempotencyKey,
+      segments,
+    });
+    res.status(result.success ? 200 : result.httpStatus).json(result);
+  });
+
+  app.delete('/api/mobile-device/:deviceId', requireFirebaseAuth, (req, res) => {
+    const deviceId = String(req.params.deviceId || '').trim();
+    if (!linkedDevices.has(deviceId)) {
+      res.status(404).json({ error: 'Linked mobile device not found.' });
+      return;
+    }
+    linkedDevices.delete(deviceId);
+    const activeDeviceSock = deviceSockets.get(deviceId);
+    if (activeDeviceSock) {
+      activeDeviceSock.close(4003, 'Device unlinked by administrator');
+      deviceSockets.delete(deviceId);
+    }
+    broadcastToDashboards({ type: 'device:unlinked', deviceId });
+    res.json({ disconnected: true, deviceId });
+  });
+
+  const httpServer = http.createServer(app);
+
+  // Secure WebSocket Pairing Bridge (/ws/mobile-bridge) attached to the same HTTP server on port 3000
+  const mobileBridgeWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    try {
+      const parsedUrl = new URL(request.url || '/', 'http://localhost');
+      if (parsedUrl.pathname !== WS_MOBILE_BRIDGE_PATH) {
+        return;
+      }
+      mobileBridgeWss.handleUpgrade(request, socket, head, (ws) => {
+        mobileBridgeWss.emit('connection', ws, request);
+      });
+    } catch {
+      socket.destroy();
+    }
+  });
+
+  mobileBridgeWss.on('connection', (ws: WebSocket) => {
+    let role: 'unauthenticated' | 'dashboard' | 'android' = 'unauthenticated';
+    let boundDeviceId: string | null = null;
+
+    const authTimeout = setTimeout(() => {
+      if (role === 'unauthenticated' && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', error: 'Authentication handshake timed out.' }));
+        ws.close(4001, 'Authentication timeout');
+      }
+    }, 10000);
+
+    ws.on('message', async (rawData: RawData) => {
+      let msg: Record<string, unknown>;
+      try {
+        const text = typeof rawData === 'string' ? rawData : rawData.toString('utf8');
+        const parsed = JSON.parse(text);
+        if (!parsed || typeof parsed !== 'object') return;
+        msg = parsed as Record<string, unknown>;
+      } catch {
+        ws.send(JSON.stringify({ type: 'error', error: 'Invalid JSON frame.' }));
+        return;
+      }
+
+      const type = typeof msg.type === 'string' ? msg.type : '';
+
+      // 1. Dashboard WebSocket authentication via Firebase ID token (not query params)
+      if (type === 'auth:dashboard' && role === 'unauthenticated') {
+        const idToken = typeof msg.idToken === 'string' ? msg.idToken.trim() : '';
+        const verification = await verifyFirebaseTokenWithRbac(idToken);
+        if (!verification.ok) {
+          ws.send(JSON.stringify({ type: 'auth:error', error: verification.error }));
+          ws.close(4001, 'Unauthorized');
+          return;
+        }
+        clearTimeout(authTimeout);
+        role = 'dashboard';
+        dashboardSockets.add(ws);
+
+        const devices = Array.from(linkedDevices.values())
+          .sort((a, b) => b.lastSeenAtMs - a.lastSeenAtMs)
+          .map(serializeDevice);
+        ws.send(JSON.stringify({ type: 'bridge:init', devices }));
+        return;
+      }
+
+      // 2. Android device first-time pairing via single-use QR pairingCode
+      if (type === 'device:pair' && role === 'unauthenticated') {
+        const paired = completeDevicePairing(msg);
+        if (!paired.ok) {
+          ws.send(JSON.stringify({ type: 'pair:error', error: paired.error }));
+          ws.close(4002, 'Invalid pairing code');
+          return;
+        }
+        clearTimeout(authTimeout);
+        role = 'android';
+        boundDeviceId = paired.deviceRecord.id;
+        deviceSockets.set(boundDeviceId, ws);
+
+        const serialized = serializeDevice(paired.deviceRecord);
+        ws.send(
+          JSON.stringify({
+            type: 'device:paired',
+            deviceToken: paired.deviceToken,
+            device: serialized,
+          })
+        );
+        broadcastToDashboards({ type: 'device:linked', device: serialized });
+        return;
+      }
+
+      // 3. Android device reconnection via previously issued deviceId + deviceToken
+      if (type === 'device:auth' && role === 'unauthenticated') {
+        const deviceId = typeof msg.deviceId === 'string' ? msg.deviceId.trim() : '';
+        const deviceToken = typeof msg.deviceToken === 'string' ? msg.deviceToken.trim() : '';
+        const record = linkedDevices.get(deviceId);
+        if (!record || !deviceToken || !verifyDeviceTokenHash(deviceToken, record.deviceTokenHash)) {
+          ws.send(JSON.stringify({ type: 'auth:error', error: 'Invalid or revoked device credentials.' }));
+          ws.close(4001, 'Invalid device token');
+          return;
+        }
+        clearTimeout(authTimeout);
+        role = 'android';
+        boundDeviceId = record.id;
+        record.lastSeenAtMs = Date.now();
+
+        const previousSock = deviceSockets.get(record.id);
+        if (previousSock && previousSock !== ws && previousSock.readyState === WebSocket.OPEN) {
+          previousSock.close(4000, 'Replaced by newer connection');
+        }
+        deviceSockets.set(record.id, ws);
+
+        const serialized = serializeDevice(record);
+        ws.send(JSON.stringify({ type: 'device:ready', device: serialized }));
+        broadcastToDashboards({
+          type: 'device:presence',
+          deviceId: record.id,
+          online: true,
+          lastSeenAt: serialized.lastSeenAt,
+        });
+        return;
+      }
+
+      // 4. Android device SMS dispatch acknowledgment (sms:result)
+      if (type === 'sms:result' && role === 'android' && boundDeviceId) {
+        const jobId = typeof msg.jobId === 'string' ? msg.jobId.trim() : '';
+        const pending = pendingSimJobs.get(jobId);
+        if (pending && pending.deviceId === boundDeviceId) {
+          clearTimeout(pending.timer);
+          pendingSimJobs.delete(jobId);
+          const rec = linkedDevices.get(boundDeviceId);
+          if (rec) rec.lastSeenAtMs = Date.now();
+          const normStatus = normalizeSimStatus(msg.status);
+          const resolvedStatus: 'sent' | 'delivered' | 'failed' | 'rejected' =
+            normStatus === 'pending' ? 'sent' : normStatus;
+          const success = resolvedStatus === 'sent' || resolvedStatus === 'delivered';
+          const detail =
+            typeof msg.error === 'string' && msg.error.trim()
+              ? msg.error.trim()
+              : `Android SIM (${rec?.deviceName || 'Device'} · ${rec?.phoneNumber || rec?.simSlot || 'auto'}) reported ${resolvedStatus}`;
+          pending.resolve({ success, status: resolvedStatus, detail });
+        }
+        return;
+      }
+
+      // 5. Android device asynchronous delivery receipt (sms:dlr)
+      if (type === 'sms:dlr' && role === 'android' && boundDeviceId) {
+        const jobId = typeof msg.jobId === 'string' ? msg.jobId.trim() : '';
+        if (jobId && jobId.length <= 128) {
+          pruneCaches();
+          const rec = linkedDevices.get(boundDeviceId);
+          if (rec) rec.lastSeenAtMs = Date.now();
+          const normStatus = normalizeSimStatus(msg.status);
+          simDlrCache.set(jobId, {
+            messageId: jobId,
+            status: normStatus,
+            rawSummary: `Android SIM delivery receipt (${rec?.deviceName || 'Device'}): ${normStatus}`,
+            updatedAt: Date.now(),
+          });
+          broadcastToDashboards({
+            type: 'sms:dlr',
+            jobId,
+            deviceId: boundDeviceId,
+            status: normStatus,
+          });
+        }
+        return;
+      }
+
+      // 6. Authenticated heartbeat frames
+      if (type === 'ping' && role !== 'unauthenticated') {
+        if (role === 'android' && boundDeviceId) {
+          const rec = linkedDevices.get(boundDeviceId);
+          if (rec) rec.lastSeenAtMs = Date.now();
+        }
+        ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+      }
     });
 
-    res.json({ received: true });
+    ws.on('close', () => {
+      clearTimeout(authTimeout);
+      if (role === 'dashboard') {
+        dashboardSockets.delete(ws);
+      } else if (role === 'android' && boundDeviceId) {
+        // Reject any in-flight SIM dispatch jobs assigned to this disconnected device
+        for (const [jobId, pending] of pendingSimJobs.entries()) {
+          if (pending.deviceId === boundDeviceId) {
+            clearTimeout(pending.timer);
+            pendingSimJobs.delete(jobId);
+            pending.resolve({
+              success: false,
+              status: 'failed',
+              detail: 'Android device disconnected before confirming SMS dispatch.',
+            });
+          }
+        }
+        if (deviceSockets.get(boundDeviceId) === ws) {
+          deviceSockets.delete(boundDeviceId);
+          const rec = linkedDevices.get(boundDeviceId);
+          if (rec) {
+            rec.lastSeenAtMs = Date.now();
+            broadcastToDashboards({
+              type: 'device:presence',
+              deviceId: boundDeviceId,
+              online: false,
+              lastSeenAt: new Date(rec.lastSeenAtMs).toISOString(),
+            });
+          }
+        }
+      }
+    });
   });
 
   if (!IS_PROD) {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : { server: httpServer },
+        watch: disableHmr ? null : {},
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -878,7 +1185,7 @@ async function startServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`ZACMA SMS PORTAL server running on http://0.0.0.0:${PORT}`);
   });
 }

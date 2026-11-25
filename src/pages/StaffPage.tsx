@@ -204,7 +204,7 @@ export function StaffPage() {
             </p>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
               Only authorized administrators and staff accounts listed here can access ZACMA SMS
-              PORTAL or dispatch messages through SMS.io.
+              PORTAL or dispatch messages through linked Android SIM devices.
             </p>
           </div>
         ) : (
