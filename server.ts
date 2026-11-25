@@ -1181,6 +1181,9 @@ class MainActivity : ComponentActivity() {
     linkedDevices.delete(deviceId);
     const activeDeviceSock = deviceSockets.get(deviceId);
     if (activeDeviceSock) {
+      if (activeDeviceSock.readyState === WebSocket.OPEN) {
+        activeDeviceSock.send(JSON.stringify({ type: 'device:unlinked', deviceId }));
+      }
       activeDeviceSock.close(4003, 'Device unlinked by administrator');
       deviceSockets.delete(deviceId);
     }
@@ -1269,6 +1272,7 @@ class MainActivity : ComponentActivity() {
         ws.send(
           JSON.stringify({
             type: 'device:paired',
+            deviceId: serialized.id,
             deviceToken: paired.deviceToken,
             device: serialized,
           })
@@ -1405,11 +1409,87 @@ class MainActivity : ComponentActivity() {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: disableHmr ? false : { server: httpServer },
+        ws: false,
+        hmr: false,
         watch: disableHmr ? null : {},
       },
       appType: 'spa',
     });
+
+    // In Vite 8 middlewareMode with ws/hmr disabled, Vite's built-in /@vite/client still
+    // attempts to connect to ws://<host>:24678 and throws an unhandled rejection behind
+    // single-port HTTPS proxies. Serve the exact style/HMR exports without opening port 24678.
+    app.get('/@vite/client', (_req, res) => {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(`
+const sheetsMap = new Map();
+const linkSheetsMap = new Map();
+if (typeof document !== "undefined") {
+  document.querySelectorAll('link[rel="stylesheet"][data-vite-dev-id]').forEach((el) => {
+    const id = el.getAttribute("data-vite-dev-id");
+    if (id) linkSheetsMap.set(id, el);
+  });
+}
+let lastInsertedStyle;
+export function updateStyle(id, content) {
+  if (typeof document === "undefined" || linkSheetsMap.has(id)) return;
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement("style");
+    style.setAttribute("type", "text/css");
+    style.setAttribute("data-vite-dev-id", id);
+    style.textContent = content;
+    if (!lastInsertedStyle) {
+      document.head.appendChild(style);
+      setTimeout(() => { lastInsertedStyle = undefined; }, 0);
+    } else {
+      lastInsertedStyle.insertAdjacentElement("afterend", style);
+    }
+    lastInsertedStyle = style;
+  } else if (style.textContent !== content) {
+    style.textContent = content;
+  }
+  sheetsMap.set(id, style);
+}
+export function removeStyle(id) {
+  if (typeof document === "undefined") return;
+  if (linkSheetsMap.has(id)) {
+    document.querySelectorAll(\`link[rel="stylesheet"][data-vite-dev-id="\${CSS.escape(id)}"]\`).forEach((el) => el.remove());
+    linkSheetsMap.delete(id);
+  }
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+export function injectQuery(url, queryToInject) {
+  if (url[0] !== "." && url[0] !== "/") return url;
+  const pathname = url.replace(/[?#].*$/, "");
+  const { search, hash } = new URL(url, "http://vite.dev");
+  return \`\${pathname}?\${queryToInject}\${search ? "&" + search.slice(1) : ""}\${hash || ""}\`;
+}
+export class ErrorOverlay extends (typeof HTMLElement !== "undefined" ? HTMLElement : class {}) {
+  close() {}
+}
+`);
+    });
+
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, 'dist');

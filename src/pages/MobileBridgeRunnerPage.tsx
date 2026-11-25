@@ -229,9 +229,10 @@ export function MobileBridgeRunnerPage() {
         error?: string;
       };
 
-      if (msg.type === 'device:paired' && msg.deviceId && msg.deviceToken && msg.device) {
+      if (msg.type === 'device:paired' && msg.deviceToken && msg.device) {
+        const resolvedDeviceId = msg.deviceId || msg.device.id;
         const nextCreds: StoredDeviceCredentials = {
-          deviceId: msg.deviceId,
+          deviceId: resolvedDeviceId,
           deviceToken: msg.deviceToken,
           device: msg.device,
         };
@@ -247,7 +248,7 @@ export function MobileBridgeRunnerPage() {
         return;
       }
 
-      if (msg.type === 'device:authed' && msg.device) {
+      if ((msg.type === 'device:ready' || msg.type === 'device:authed') && msg.device) {
         setStoredCreds((prev) => {
           if (!prev) return prev;
           const updated = { ...prev, device: msg.device! };
@@ -368,8 +369,16 @@ export function MobileBridgeRunnerPage() {
         handleServerFrame(String(event.data || '{}'));
       });
 
-      ws.addEventListener('close', () => {
+      ws.addEventListener('close', (event) => {
         if (disposed || !credsRef.current) return;
+        if (event.code === 4003 || event.code === 4001) {
+          saveStoredCredentials(null);
+          setStoredCreds(null);
+          setPendingJobs([]);
+          setSocketState('idle');
+          setNotice('This phone was unlinked or its session expired. Scan a fresh QR code to re-link.');
+          return;
+        }
         setSocketState('reconnecting');
         const attempt = reconnectAttemptRef.current;
         const delayMs = Math.min(12000, 1000 * Math.pow(2, attempt));
