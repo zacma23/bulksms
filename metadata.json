@@ -1,6 +1,6 @@
 {
   "name": "ZACMA SMS PORTAL",
   "description": "Direct Android SIM-based Bulk SMS Management Portal for ZACMA Technology with Dual SIM routing, contact groups, Excel/CSV imports, and delivery analytics.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": []
 }

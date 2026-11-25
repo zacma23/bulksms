@@ -125,13 +125,15 @@ interface LinkedDeviceRecord {
   carrierName: string;
   simSlot: SimSlotPreference;
   dualSimSupported: boolean;
+  clientType: 'android-native' | 'mobile-web';
   connectedAtMs: number;
   lastSeenAtMs: number;
   linkedByEmail: string;
 }
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
-const SIM_DISPATCH_TIMEOUT_MS = 25 * 1000;
+const SIM_DISPATCH_TIMEOUT_NATIVE_MS = 25 * 1000;
+const SIM_DISPATCH_TIMEOUT_WEB_MS = 120 * 1000;
 const WS_MOBILE_BRIDGE_PATH = '/ws/mobile-bridge';
 const pairingSessions = new Map<string, PairingSessionRecord>();
 const linkedDevices = new Map<string, LinkedDeviceRecord>();
@@ -207,6 +209,9 @@ function dispatchViaAndroidSim(params: {
           : 'ANDROID-SIM'
   );
 
+  const dispatchTimeoutMs =
+    record.clientType === 'mobile-web' ? SIM_DISPATCH_TIMEOUT_WEB_MS : SIM_DISPATCH_TIMEOUT_NATIVE_MS;
+
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       pendingSimJobs.delete(jobId);
@@ -218,11 +223,11 @@ function dispatchViaAndroidSim(params: {
         currency: 'SIM',
         segments: params.segments,
         httpStatus: 504,
-        apiResponseSummary: `Timed out waiting for Android device "${record.deviceName}" (${effectiveSimSlot.toUpperCase()}) to confirm SIM SMS dispatch.`,
+        apiResponseSummary: `Timed out waiting for phone "${record.deviceName}" (${effectiveSimSlot.toUpperCase()}) to confirm SIM SMS dispatch.`,
         deduplicated: false,
         simSender,
       });
-    }, SIM_DISPATCH_TIMEOUT_MS);
+    }, dispatchTimeoutMs);
 
     pendingSimJobs.set(jobId, {
       deviceId: record.id,
@@ -311,6 +316,7 @@ function serializeDevice(d: LinkedDeviceRecord) {
     carrierName: d.carrierName,
     simSlot: d.simSlot,
     dualSimSupported: d.dualSimSupported,
+    clientType: d.clientType,
     online,
     connectedAt: new Date(d.connectedAtMs).toISOString(),
     lastSeenAt: new Date(d.lastSeenAtMs).toISOString(),
@@ -337,6 +343,7 @@ function completeDevicePairing(body: {
   carrierName?: unknown;
   simSlot?: unknown;
   dualSimSupported?: unknown;
+  clientType?: unknown;
 }):
   | { ok: true; deviceToken: string; deviceRecord: LinkedDeviceRecord }
   | { ok: false; status: number; error: string } {
@@ -361,6 +368,8 @@ function completeDevicePairing(body: {
   const deviceId = `dev_${crypto.randomBytes(8).toString('hex')}`;
   const deviceToken = crypto.randomBytes(32).toString('base64url');
   const now = Date.now();
+  const clientType: 'android-native' | 'mobile-web' =
+    body.clientType === 'mobile-web' ? 'mobile-web' : 'android-native';
 
   const deviceRecord: LinkedDeviceRecord = {
     id: deviceId,
@@ -383,6 +392,7 @@ function completeDevicePairing(body: {
     ).slice(0, 60),
     simSlot: normalizeSimSlot(body.simSlot ?? session.simSlot),
     dualSimSupported: body.dualSimSupported === true,
+    clientType,
     connectedAtMs: now,
     lastSeenAtMs: now,
     linkedByEmail: session.createdByEmail,
@@ -936,6 +946,230 @@ async function startServer(): Promise<void> {
       segments,
     });
     res.status(result.success ? 200 : result.httpStatus).json(result);
+  });
+
+  app.get('/api/mobile-device/companion-package', requireFirebaseAuth, (req, res) => {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+    const wsProto = forwardedProto === 'https' ? 'wss' : 'ws';
+    const wsUrl = host ? `${wsProto}://${host}${WS_MOBILE_BRIDGE_PATH}` : WS_MOBILE_BRIDGE_PATH;
+
+    const manifestXml = `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.zacma.simbridge">
+  <uses-permission android:name="android.permission.SEND_SMS" />
+  <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <application android:label="ZACMA SIM Bridge" android:allowBackup="false">
+    <activity android:name=".MainActivity" android:exported="true">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>`;
+
+    const mainActivityKt = `package com.zacma.simbridge
+
+import android.Manifest
+import android.app.Activity
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.telephony.SmsManager
+import android.telephony.SubscriptionManager
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import okhttp3.*
+import org.json.JSONObject
+
+class MainActivity : ComponentActivity() {
+  private val client = OkHttpClient()
+  private var ws: WebSocket? = null
+  private val wsUrl = "${wsUrl}"
+
+  // Automatically prompts user to grant SEND_SMS, READ_PHONE_STATE & POST_NOTIFICATIONS on startup
+  private val permissionLauncher = registerForActivityResult(
+    ActivityResultContracts.RequestMultiplePermissions()
+  ) { results ->
+    val smsGranted = results[Manifest.permission.SEND_SMS] == true
+    if (smsGranted) {
+      reconnectIfPaired()
+    }
+  }
+
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    requestRequiredPermissions()
+  }
+
+  private fun requestRequiredPermissions() {
+    val perms = mutableListOf(
+      Manifest.permission.SEND_SMS,
+      Manifest.permission.READ_PHONE_STATE
+    )
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      perms.add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    val missing = perms.filter {
+      ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+    }
+    if (missing.isNotEmpty()) {
+      permissionLauncher.launch(missing.toTypedArray())
+    } else {
+      reconnectIfPaired()
+    }
+  }
+
+  fun pairFromScannedQr(rawQrText: String) {
+    // Supports both ZACMA HTTPS QR URLs (?pair=...) and raw JSON payloads
+    val pairingCode = if (rawQrText.startsWith("http")) {
+      Uri.parse(rawQrText).getQueryParameter("pair") ?: return
+    } else {
+      JSONObject(rawQrText).optString("pairingCode")
+    }
+    val simSlot = if (rawQrText.startsWith("http")) {
+      Uri.parse(rawQrText).getQueryParameter("sim") ?: "auto"
+    } else {
+      JSONObject(rawQrText).optString("simSlot", "auto")
+    }
+
+    val request = Request.Builder().url(wsUrl).build()
+    ws = client.newWebSocket(request, object : WebSocketListener() {
+      override fun onOpen(webSocket: WebSocket, response: Response) {
+        val frame = JSONObject().apply {
+          put("type", "device:pair")
+          put("pairingCode", pairingCode)
+          put("deviceName", "\${Build.MANUFACTURER} \${Build.MODEL}")
+          put("androidVersion", "Android \${Build.VERSION.RELEASE}")
+          put("simSlot", simSlot)
+          put("dualSimSupported", true)
+          put("clientType", "android-native")
+        }
+        webSocket.send(frame.toString())
+      }
+
+      override fun onMessage(webSocket: WebSocket, text: String) {
+        handleBridgeFrame(webSocket, JSONObject(text))
+      }
+    })
+  }
+
+  private fun reconnectIfPaired() {
+    val prefs = getSharedPreferences("zacma_sim_bridge", Context.MODE_PRIVATE)
+    val deviceId = prefs.getString("deviceId", null) ?: return
+    val deviceToken = prefs.getString("deviceToken", null) ?: return
+    val request = Request.Builder().url(wsUrl).build()
+    ws = client.newWebSocket(request, object : WebSocketListener() {
+      override fun onOpen(webSocket: WebSocket, response: Response) {
+        webSocket.send(JSONObject(mapOf(
+          "type" to "device:auth",
+          "deviceId" to deviceId,
+          "deviceToken" to deviceToken
+        )).toString())
+      }
+
+      override fun onMessage(webSocket: WebSocket, text: String) {
+        handleBridgeFrame(webSocket, JSONObject(text))
+      }
+    })
+  }
+
+  private fun handleBridgeFrame(webSocket: WebSocket, msg: JSONObject) {
+    when (msg.optString("type")) {
+      "device:paired" -> {
+        val deviceObj = msg.getJSONObject("device")
+        getSharedPreferences("zacma_sim_bridge", Context.MODE_PRIVATE).edit()
+          .putString("deviceId", deviceObj.getString("id"))
+          .putString("deviceToken", msg.getString("deviceToken"))
+          .apply()
+      }
+      "sms:dispatch" -> {
+        val jobId = msg.getString("jobId")
+        val to = msg.getString("to")
+        val body = msg.getString("message")
+        val slot = msg.optString("simSlot", "auto")
+        sendViaSim(webSocket, jobId, to, body, slot)
+      }
+    }
+  }
+
+  private fun sendViaSim(webSocket: WebSocket, jobId: String, to: String, body: String, slot: String) {
+    try {
+      val subManager = getSystemService(SubscriptionManager::class.java)
+      val simIdx = when (slot) { "sim1" -> 0; "sim2" -> 1; else -> -1 }
+      val subInfo = if (simIdx >= 0) subManager.activeSubscriptionInfoList?.getOrNull(simIdx) else null
+      val smsManager = if (subInfo != null) {
+        getSystemService(SmsManager::class.java).createForSubscriptionId(subInfo.subscriptionId)
+      } else {
+        getSystemService(SmsManager::class.java)
+      }
+
+      val sentAction = "ZACMA_SMS_SENT_\$jobId"
+      val deliveredAction = "ZACMA_SMS_DELIVERED_\$jobId"
+
+      registerReceiver(object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+          unregisterReceiver(this)
+          val ok = resultCode == Activity.RESULT_OK
+          webSocket.send(JSONObject(mapOf(
+            "type" to "sms:result",
+            "jobId" to jobId,
+            "status" to if (ok) "sent" else "failed",
+            "error" to if (ok) "" else "Android SmsManager resultCode=\$resultCode"
+          )).toString())
+        }
+      }, IntentFilter(sentAction), RECEIVER_NOT_EXPORTED)
+
+      registerReceiver(object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+          unregisterReceiver(this)
+          if (resultCode == Activity.RESULT_OK) {
+            webSocket.send(JSONObject(mapOf(
+              "type" to "sms:dlr",
+              "jobId" to jobId,
+              "status" to "delivered"
+            )).toString())
+          }
+        }
+      }, IntentFilter(deliveredAction), RECEIVER_NOT_EXPORTED)
+
+      val sentPi = PendingIntent.getBroadcast(this, jobId.hashCode(), Intent(sentAction), PendingIntent.FLAG_IMMUTABLE)
+      val deliveredPi = PendingIntent.getBroadcast(this, jobId.hashCode() + 1, Intent(deliveredAction), PendingIntent.FLAG_IMMUTABLE)
+
+      val parts = smsManager.divideMessage(body)
+      val sentIntents = ArrayList<PendingIntent>().apply { repeat(parts.size) { add(sentPi) } }
+      val deliveryIntents = ArrayList<PendingIntent>().apply { repeat(parts.size) { add(deliveredPi) } }
+      smsManager.sendMultipartTextMessage(to, null, parts, sentIntents, deliveryIntents)
+    } catch (e: Exception) {
+      webSocket.send(JSONObject(mapOf(
+        "type" to "sms:result",
+        "jobId" to jobId,
+        "status" to "failed",
+        "error" to (e.message ?: "SIM send exception")
+      )).toString())
+    }
+  }
+}`;
+
+    res.json({
+      wsUrl,
+      files: [
+        { path: 'app/src/main/AndroidManifest.xml', content: manifestXml },
+        { path: 'app/src/main/java/com/zacma/simbridge/MainActivity.kt', content: mainActivityKt },
+      ],
+    });
   });
 
   app.delete('/api/mobile-device/:deviceId', requireFirebaseAuth, (req, res) => {

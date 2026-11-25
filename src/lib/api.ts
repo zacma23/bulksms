@@ -197,3 +197,13 @@ export function sendMobileDeviceTestSms(
     }
   );
 }
+
+export interface AndroidCompanionPackageResponse {
+  wsUrl: string;
+  files: Array<{ path: string; content: string }>;
+}
+
+export function fetchAndroidCompanionPackage(): Promise<AndroidCompanionPackageResponse> {
+  return authFetch<AndroidCompanionPackageResponse>('/api/mobile-device/companion-package');
+}
+

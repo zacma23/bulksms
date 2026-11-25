@@ -7,6 +7,8 @@ import {
   ChevronUp,
   Code2,
   Copy,
+  Download,
+  Link2,
   RefreshCw,
   Send,
   Smartphone,
@@ -15,6 +17,7 @@ import {
 import {
   createMobilePairingSession,
   disconnectLinkedDevice,
+  fetchAndroidCompanionPackage,
   fetchMobileDeviceStatus,
   sendMobileDeviceTestSms,
   updateLinkedDeviceSimSlot,
@@ -92,7 +95,8 @@ export function ConnectMobileDevice() {
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [socketState, setSocketState] = useState<SocketState>('disconnected');
   const [error, setError] = useState<string | null>(null);
-  const [copiedKey, setCopiedKey] = useState<'pin' | 'payload' | 'kotlin' | null>(null);
+  const [copiedKey, setCopiedKey] = useState<'pin' | 'link' | 'payload' | 'kotlin' | null>(null);
+  const [downloadingCompanion, setDownloadingCompanion] = useState(false);
   const [showTechnicalGuide, setShowTechnicalGuide] = useState(false);
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [updatingDeviceId, setUpdatingDeviceId] = useState<string | null>(null);
@@ -309,6 +313,11 @@ export function ConnectMobileDevice() {
     [resolvedOrigin, session?.wsEndpoint]
   );
 
+  const pairingUrl = useMemo(() => {
+    if (!session || !resolvedOrigin) return '';
+    return `${resolvedOrigin}/?pair=${encodeURIComponent(session.pairingCode)}&sim=${encodeURIComponent(session.simSlot)}&pin=${encodeURIComponent(session.shortPin)}`;
+  }, [session, resolvedOrigin]);
+
   const qrPayload = useMemo(() => {
     if (!session) return '';
     return JSON.stringify({
@@ -377,7 +386,7 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
 }`;
   }, [resolvedWsUrl]);
 
-  const handleCopy = async (key: 'pin' | 'payload' | 'kotlin', text: string) => {
+  const handleCopy = async (key: 'pin' | 'link' | 'payload' | 'kotlin', text: string) => {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
@@ -385,6 +394,43 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
       window.setTimeout(() => setCopiedKey(null), 2000);
     } catch {
       setError('Clipboard copy failed. Select and copy manually.');
+    }
+  };
+
+  const handleDownloadCompanion = async () => {
+    setDownloadingCompanion(true);
+    setError(null);
+    try {
+      const pkg = await fetchAndroidCompanionPackage();
+      const combined = [
+        `// ZACMA Android SIM Bridge Companion Package`,
+        `// Pre-wired WebSocket Endpoint: ${pkg.wsUrl}`,
+        `// Automatically prompts Android runtime permissions: SEND_SMS, READ_PHONE_STATE, POST_NOTIFICATIONS`,
+        '',
+        ...pkg.files.flatMap((file) => [
+          `========================================================================`,
+          `FILE: ${file.path}`,
+          `========================================================================`,
+          file.content,
+          '',
+        ]),
+      ].join('\n');
+
+      const blob = new Blob([combined], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = 'zacma-android-sim-bridge-kotlin.txt';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Unable to download Android companion source.'
+      );
+    } finally {
+      setDownloadingCompanion(false);
     }
   };
 
@@ -535,12 +581,12 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
             ) : session && !countdown.expired ? (
               <div className="bg-white p-3 rounded-xl border border-slate-200">
                 <QRCodeSVG
-                  value={qrPayload}
+                  value={pairingUrl || qrPayload}
                   size={172}
                   level="M"
                   bgColor="#FFFFFF"
                   fgColor="#0F172A"
-                  title="ZACMA Secure WebSocket Android Pairing QR Code"
+                  title="ZACMA Android SIM Pairing QR Code"
                 />
               </div>
             ) : (
@@ -570,6 +616,16 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
           {/* Pairing PIN & Quick Copy Controls */}
           {session && (
             <div className="w-full max-w-[260px] space-y-2.5">
+              {pairingUrl && !countdown.expired && (
+                <a
+                  href={pairingUrl}
+                  className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold inline-flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Smartphone className="w-3.5 h-3.5" />
+                  Pair This Phone Directly
+                </a>
+              )}
+
               <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-left">
                 <div className="min-w-0">
                   <p className="text-[11px] text-slate-500">Pairing PIN</p>
@@ -591,23 +647,43 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
                 </button>
               </div>
 
-              <button
-                type="button"
-                onClick={() => void handleCopy('payload', qrPayload)}
-                className="w-full min-h-[42px] px-3.5 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                {copiedKey === 'payload' ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-700" />
-                    WebSocket Payload Copied
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    Copy Pairing Payload JSON
-                  </>
-                )}
-              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleCopy('link', pairingUrl)}
+                  className="min-h-[40px] px-2.5 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {copiedKey === 'link' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-700" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Link2 className="w-3.5 h-3.5" />
+                      Copy Link
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleCopy('payload', qrPayload)}
+                  className="min-h-[40px] px-2.5 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {copiedKey === 'payload' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-700" />
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      Copy JSON
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           )}
 
@@ -672,12 +748,10 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
               </span>
               <div className="space-y-0.5">
                 <p className="text-sm font-semibold text-slate-900">
-                  Open the ZACMA Android SIM Bridge companion app
+                  Scan the QR code with your phone camera (Instant Mode)
                 </p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Because browsers cannot access SIM hardware directly, the Android companion app
-                  receives jobs over <code className="font-mono text-slate-800">/ws/mobile-bridge</code>{' '}
-                  and sends them via Android&apos;s native <code className="font-mono text-slate-800">SmsManager</code>.
+                  Point your Android camera at the QR code (or tap <strong>Pair This Phone Directly</strong> on mobile). It opens the ZACMA Phone SIM Bridge immediately—no extra app install required—and routes messages straight to your phone&apos;s SMS app.
                 </p>
               </div>
             </li>
@@ -688,12 +762,14 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
               </span>
               <div className="space-y-0.5">
                 <p className="text-sm font-semibold text-slate-900">
-                  Grant SMS &amp; Dual SIM permissions on Android
+                  Optional: Native Android Companion for unattended bulk SMS
                 </p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Approve <code className="font-mono text-slate-800">SEND_SMS</code> and{' '}
-                  <code className="font-mono text-slate-800">READ_PHONE_STATE</code> so your device
-                  can route messages through SIM 1 or SIM 2 and stream live delivery status back.
+                  For fully automatic background Dual-SIM sending via Android&apos;s{' '}
+                  <code className="font-mono text-slate-800">SmsManager</code>, download the pre-wired
+                  Kotlin companion below. On launch it automatically pops up Android&apos;s permission
+                  dialog for <code className="font-mono text-slate-800">SEND_SMS</code> and{' '}
+                  <code className="font-mono text-slate-800">READ_PHONE_STATE</code>.
                 </p>
               </div>
             </li>
@@ -704,11 +780,11 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
               </span>
               <div className="space-y-0.5">
                 <p className="text-sm font-semibold text-slate-900">
-                  Scan the QR code to exchange a device token
+                  Live WebSocket sync &amp; instant SIM dispatch
                 </p>
                 <p className="text-xs text-slate-600 leading-relaxed">
-                  Scan the QR code from the Android app. It sends the single-use pairing code over
-                  WebSocket, receives a permanent hashed device credential, and appears live below.
+                  Once linked, your handset appears online below with a permanent hashed device token
+                  and can switch between Auto SIM, SIM 1, or SIM 2 anytime.
                 </p>
               </div>
             </li>
@@ -718,10 +794,20 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={() => setShowSetupModal(true)}
-              className="min-h-[42px] px-4 py-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
+              onClick={() => void handleDownloadCompanion()}
+              disabled={downloadingCompanion}
+              className="min-h-[42px] px-4 py-2 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap disabled:opacity-60"
             >
-              <BookOpen className="w-3.5 h-3.5" />
+              <Download className="w-3.5 h-3.5" />
+              {downloadingCompanion ? 'Preparing Source...' : 'Download Android Kotlin Companion'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowSetupModal(true)}
+              className="min-h-[42px] px-4 py-2 rounded-xl border border-slate-300 hover:bg-slate-50 text-xs font-semibold text-slate-800 inline-flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-slate-600" />
               Install &amp; Permissions Guide
             </button>
 
@@ -821,8 +907,9 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
                     </span>
                   </div>
                   <p className="text-xs text-slate-500 font-mono tabular-nums truncate">
-                    {device.phoneNumber} · {device.carrierName} · {device.androidVersion} · Seen{' '}
-                    {formatRelativeTime(device.lastSeenAt)}
+                    {device.phoneNumber} · {device.carrierName} ·{' '}
+                    {device.clientType === 'mobile-web' ? 'Mobile Web SIM' : 'Native SmsManager'} ·{' '}
+                    {device.androidVersion} · Seen {formatRelativeTime(device.lastSeenAt)}
                   </p>
                 </div>
 

@@ -174,6 +174,7 @@ export interface LinkedMobileDevice {
   carrierName: string;
   simSlot: SimSlotPreference;
   dualSimSupported: boolean;
+  clientType?: 'android-native' | 'mobile-web';
   online: boolean;
   connectedAt: string;
   lastSeenAt: string;

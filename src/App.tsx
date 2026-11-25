@@ -12,7 +12,14 @@ import { CampaignsPage } from './pages/CampaignsPage';
 import { HistoryPage } from './pages/HistoryPage';
 import { StaffPage } from './pages/StaffPage';
 import { AuditGatewayPage } from './pages/AuditGatewayPage';
+import { MobileBridgeRunnerPage } from './pages/MobileBridgeRunnerPage';
 import type { PortalTab } from './types/portal';
+
+function isPhoneBridgeRoute(): boolean {
+  if (typeof window === 'undefined') return false;
+  const params = new URLSearchParams(window.location.search);
+  return params.has('pair') || params.get('mode') === 'phone-bridge';
+}
 
 function PortalShell() {
   const { loading, authorized } = useAuth();
@@ -50,6 +57,14 @@ function PortalShell() {
 }
 
 export default function App() {
+  if (isPhoneBridgeRoute()) {
+    return (
+      <ErrorBoundary>
+        <MobileBridgeRunnerPage />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <ErrorBoundary>
       <AuthProvider>
