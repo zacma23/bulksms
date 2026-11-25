@@ -1,4 +1,14 @@
-import { auth } from './firebase';
+import { buildAndroidCompanionSource } from './androidCompanionGenerator';
+import {
+  createFirestorePairingSession,
+  dispatchSmsViaFirestoreBridge,
+  fetchActiveFirestorePairingSession,
+  fetchFirestoreDeliveryStatuses,
+  listFirestoreMobileDevices,
+  unlinkFirestoreDevice,
+  updateFirestoreDeviceSimSlot,
+} from './firestoreSimBridge';
+import { generateSafeId } from './firebase';
 import type {
   LinkedMobileDevice,
   MobileDeviceStatusResponse,
@@ -27,54 +37,6 @@ export function normalizeDeliveryStatus(
   return fallback;
 }
 
-async function authFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('You must be signed in to access ZACMA SIM bridge services.');
-  }
-  const token = await user.getIdToken();
-  const res = await fetch(url, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-      ...(init?.headers || {}),
-    },
-  });
-
-  const rawText = await res.text();
-  let data: Record<string, unknown> | null = null;
-  if (rawText) {
-    try {
-      const parsed = JSON.parse(rawText);
-      if (parsed && typeof parsed === 'object') {
-        data = parsed as Record<string, unknown>;
-      }
-    } catch {
-      data = null;
-    }
-  }
-
-  if (!data) {
-    throw new Error(
-      `SIM bridge endpoint returned an invalid response (HTTP ${res.status}). Ensure the backend server is running.`
-    );
-  }
-
-  if (!res.ok && !('httpStatus' in data)) {
-    throw new Error(
-      typeof data.error === 'string' && data.error
-        ? data.error
-        : `SIM bridge request failed (HTTP ${res.status})`
-    );
-  }
-  return data as T;
-}
-
-export function fetchSimBridgeStatus(): Promise<SimBridgeStatus> {
-  return authFetch<SimBridgeStatus>('/api/sms/config-status');
-}
-
 export interface SendSmsResponse {
   success: boolean;
   status: SmsDeliveryStatus;
@@ -89,6 +51,25 @@ export interface SendSmsResponse {
   error?: string;
 }
 
+export interface StatusUpdateEntry {
+  status: SmsDeliveryStatus;
+  segments?: number;
+  httpStatus: number;
+  apiResponseSummary: string;
+}
+
+export async function fetchSimBridgeStatus(): Promise<SimBridgeStatus> {
+  const devices = await listFirestoreMobileDevices();
+  const onlineDevicesCount = devices.filter((d) => d.online).length;
+  return {
+    simBridgeReady: onlineDevicesCount > 0,
+    onlineDevicesCount,
+    linkedDevicesCount: devices.length,
+    devices,
+    wsEndpoint: '/ws/mobile-bridge',
+  };
+}
+
 export async function dispatchSingleSms(params: {
   to: string;
   message: string;
@@ -97,105 +78,58 @@ export async function dispatchSingleSms(params: {
   simSlot?: SimSlotPreference;
   idempotencyKey: string;
 }): Promise<SendSmsResponse> {
-  const raw = await authFetch<Partial<SendSmsResponse>>('/api/sms/send', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
-  const success = raw.success === true;
-  const fallbackStatus: SmsDeliveryStatus = success ? 'sent' : 'failed';
-  const segNum = Number(raw.segments);
-  const httpNum = Number(raw.httpStatus);
+  return dispatchSmsViaFirestoreBridge(params);
+}
 
+export async function fetchDeliveryStatuses(
+  messageIds: string[]
+): Promise<{ updates: Record<string, StatusUpdateEntry>; error?: string }> {
+  return fetchFirestoreDeliveryStatuses(messageIds);
+}
+
+export async function fetchMobileDeviceStatus(): Promise<MobileDeviceStatusResponse> {
+  const [devices, activeSession] = await Promise.all([
+    listFirestoreMobileDevices(),
+    fetchActiveFirestorePairingSession(),
+  ]);
   return {
-    success,
-    status: normalizeDeliveryStatus(raw.status, fallbackStatus),
-    messageId: typeof raw.messageId === 'string' ? raw.messageId : '',
-    cost: 0,
-    currency: 'SIM',
-    segments: Number.isFinite(segNum) && segNum >= 1 ? Math.round(segNum) : 1,
-    httpStatus: Number.isFinite(httpNum) && httpNum >= 0 ? Math.round(httpNum) : success ? 200 : 500,
-    apiResponseSummary:
-      typeof raw.apiResponseSummary === 'string' && raw.apiResponseSummary
-        ? raw.apiResponseSummary
-        : typeof raw.error === 'string' && raw.error
-          ? raw.error
-          : success
-            ? 'Dispatched via Android SIM'
-            : 'Android SIM dispatch failed',
-    deduplicated: raw.deduplicated === true,
-    ...(typeof raw.simSender === 'string' && raw.simSender ? { simSender: raw.simSender } : {}),
-    ...(typeof raw.error === 'string' ? { error: raw.error } : {}),
+    devices,
+    activeSession,
   };
 }
 
-export interface StatusUpdateEntry {
-  status: SmsDeliveryStatus;
-  segments?: number;
-  httpStatus: number;
-  apiResponseSummary: string;
-}
-
-export function fetchDeliveryStatuses(
-  messageIds: string[]
-): Promise<{ updates: Record<string, StatusUpdateEntry>; error?: string }> {
-  return authFetch<{ updates: Record<string, StatusUpdateEntry>; error?: string }>(
-    '/api/sms/status',
-    {
-      method: 'POST',
-      body: JSON.stringify({ messageIds }),
-    }
-  );
-}
-
-export function fetchMobileDeviceStatus(): Promise<MobileDeviceStatusResponse> {
-  return authFetch<MobileDeviceStatusResponse>('/api/mobile-device/status');
-}
-
-export function createMobilePairingSession(
+export async function createMobilePairingSession(
   simSlot: SimSlotPreference
 ): Promise<MobilePairingSession> {
-  return authFetch<MobilePairingSession>('/api/mobile-device/pairing-session', {
-    method: 'POST',
-    body: JSON.stringify({ simSlot }),
-  });
+  return createFirestorePairingSession(simSlot);
 }
 
-export function updateLinkedDeviceSimSlot(
+export async function updateLinkedDeviceSimSlot(
   deviceId: string,
   simSlot: SimSlotPreference
 ): Promise<{ device: LinkedMobileDevice }> {
-  return authFetch<{ device: LinkedMobileDevice }>(
-    `/api/mobile-device/${encodeURIComponent(deviceId)}/sim`,
-    {
-      method: 'PATCH',
-      body: JSON.stringify({ simSlot }),
-    }
-  );
+  const device = await updateFirestoreDeviceSimSlot(deviceId, simSlot);
+  return { device };
 }
 
-export function disconnectLinkedDevice(
+export async function disconnectLinkedDevice(
   deviceId: string
 ): Promise<{ disconnected: boolean; deviceId: string }> {
-  return authFetch<{ disconnected: boolean; deviceId: string }>(
-    `/api/mobile-device/${encodeURIComponent(deviceId)}`,
-    {
-      method: 'DELETE',
-    }
-  );
+  await unlinkFirestoreDevice(deviceId);
+  return { disconnected: true, deviceId };
 }
 
-export function sendMobileDeviceTestSms(
+export async function sendMobileDeviceTestSms(
   deviceId: string,
   to: string,
   message: string
 ): Promise<SendSmsResponse> {
-  return authFetch<SendSmsResponse>(
-    `/api/mobile-device/${encodeURIComponent(deviceId)}/test-sms`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ to, message }),
-    }
-  );
+  return dispatchSmsViaFirestoreBridge({
+    deviceId,
+    to,
+    message,
+    idempotencyKey: generateSafeId('test'),
+  });
 }
 
 export interface AndroidCompanionPackageResponse {
@@ -203,7 +137,10 @@ export interface AndroidCompanionPackageResponse {
   files: Array<{ path: string; content: string }>;
 }
 
-export function fetchAndroidCompanionPackage(): Promise<AndroidCompanionPackageResponse> {
-  return authFetch<AndroidCompanionPackageResponse>('/api/mobile-device/companion-package');
+export async function fetchAndroidCompanionPackage(): Promise<AndroidCompanionPackageResponse> {
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'https://zacma.app';
+  return buildAndroidCompanionSource(origin);
 }
-

@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Check,
   ExternalLink,
+  LogIn,
   MessageSquare,
   Power,
   RefreshCw,
@@ -12,10 +13,19 @@ import {
   X,
 } from 'lucide-react';
 import { ZacmaBrandMark } from '../components/ZacmaBrandMark';
+import { useAuth } from '../context/AuthContext';
+import {
+  completeFirestoreDevicePairing,
+  completeFirestoreSmsJob,
+  heartbeatFirestoreDevice,
+  subscribeDeviceQueuedSmsJobs,
+  subscribeFirestoreDeviceDoc,
+  type FirestoreSmsJobItem,
+} from '../lib/firestoreSimBridge';
 import { isValidE164Phone, normalizePhoneNumber } from '../lib/smsUtils';
 import type { LinkedMobileDevice, SimSlotPreference } from '../types/portal';
 
-const STORAGE_KEY = 'zacma_mobile_bridge_creds_v1';
+const STORAGE_KEY = 'zacma_fs_mobile_device_v1';
 
 const SIM_OPTIONS: { value: SimSlotPreference; label: string }[] = [
   { value: 'auto', label: 'Auto SIM' },
@@ -25,19 +35,9 @@ const SIM_OPTIONS: { value: SimSlotPreference; label: string }[] = [
 
 const CARRIER_PRESETS = ['Ethio Telecom', 'Safaricom Ethiopia'];
 
-interface StoredDeviceCredentials {
+interface StoredDeviceState {
   deviceId: string;
-  deviceToken: string;
   device: LinkedMobileDevice;
-}
-
-interface IncomingSmsJob {
-  jobId: string;
-  to: string;
-  message: string;
-  simSlot: SimSlotPreference;
-  receivedAt: string;
-  openedInSmsApp?: boolean;
 }
 
 interface CompletedSmsJob {
@@ -47,8 +47,6 @@ interface CompletedSmsJob {
   status: 'sent' | 'failed';
   completedAt: string;
 }
-
-type BridgeSocketState = 'idle' | 'connecting' | 'pairing' | 'online' | 'reconnecting';
 
 function detectHandsetDefaults(): { deviceName: string; androidVersion: string; isIos: boolean } {
   if (typeof navigator === 'undefined') {
@@ -75,12 +73,6 @@ function detectHandsetDefaults(): { deviceName: string; androidVersion: string; 
   return { deviceName, androidVersion, isIos };
 }
 
-function buildWebSocketUrl(): string {
-  if (typeof window === 'undefined') return '/ws/mobile-bridge';
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/ws/mobile-bridge`;
-}
-
 function extractPairingInput(rawInput: string): {
   pairingCode: string;
   simSlot?: SimSlotPreference;
@@ -88,7 +80,6 @@ function extractPairingInput(rawInput: string): {
   const trimmed = rawInput.trim();
   if (!trimmed) return { pairingCode: '' };
 
-  // Support pasted JSON payload from QR
   if (trimmed.startsWith('{')) {
     try {
       const parsed = JSON.parse(trimmed) as { pairingCode?: string; simSlot?: string };
@@ -102,7 +93,6 @@ function extractPairingInput(rawInput: string): {
     }
   }
 
-  // Support pasted full pairing URL (?pair=...)
   if (trimmed.includes('pair=')) {
     try {
       const url = new URL(trimmed.startsWith('http') ? trimmed : `https://zacma.local/?${trimmed}`);
@@ -127,14 +117,14 @@ function buildSmsUri(to: string, message: string, isIos: boolean): string {
   return `sms:${cleanTo}${sep}body=${encodeURIComponent(message)}`;
 }
 
-function readStoredCredentials(): StoredDeviceCredentials | null {
+function readStoredDevice(): StoredDeviceState | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredDeviceCredentials>;
-    if (parsed.deviceId && parsed.deviceToken && parsed.device) {
-      return parsed as StoredDeviceCredentials;
+    const parsed = JSON.parse(raw) as Partial<StoredDeviceState>;
+    if (parsed.deviceId && parsed.device) {
+      return parsed as StoredDeviceState;
     }
     return null;
   } catch {
@@ -142,13 +132,13 @@ function readStoredCredentials(): StoredDeviceCredentials | null {
   }
 }
 
-function saveStoredCredentials(creds: StoredDeviceCredentials | null): void {
+function saveStoredDevice(state: StoredDeviceState | null): void {
   if (typeof window === 'undefined') return;
   try {
-    if (!creds) {
+    if (!state) {
       window.localStorage.removeItem(STORAGE_KEY);
     } else {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(creds));
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     }
   } catch {
     // Ignore storage quota errors
@@ -156,6 +146,13 @@ function saveStoredCredentials(creds: StoredDeviceCredentials | null): void {
 }
 
 export function MobileBridgeRunnerPage() {
+  const {
+    loading: authLoading,
+    authorized,
+    firebaseUser,
+    signInWithGoogle,
+    error: authErrorMessage,
+  } = useAuth();
   const handset = useMemo(() => detectHandsetDefaults(), []);
 
   const initialQuery = useMemo(() => {
@@ -171,10 +168,9 @@ export function MobileBridgeRunnerPage() {
     return { pair, sim, pin };
   }, []);
 
-  const [storedCreds, setStoredCreds] = useState<StoredDeviceCredentials | null>(() => {
-    // If the user explicitly scanned a new ?pair= QR code, prioritize pairing the new token
+  const [storedDevice, setStoredDevice] = useState<StoredDeviceState | null>(() => {
     if (initialQuery.pair) return null;
-    return readStoredCredentials();
+    return readStoredDevice();
   });
 
   const [pairingInput, setPairingInput] = useState(initialQuery.pair);
@@ -183,246 +179,121 @@ export function MobileBridgeRunnerPage() {
   const [carrierName, setCarrierName] = useState(CARRIER_PRESETS[0]);
   const [simSlot, setSimSlot] = useState<SimSlotPreference>(initialQuery.sim);
 
-  const [socketState, setSocketState] = useState<BridgeSocketState>('idle');
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [signingIn, setSigningIn] = useState(false);
+  const [syncLive, setSyncLive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [pendingJobs, setPendingJobs] = useState<IncomingSmsJob[]>([]);
+  const [pendingJobs, setPendingJobs] = useState<FirestoreSmsJobItem[]>([]);
+  const [openedJobIds, setOpenedJobIds] = useState<Record<string, boolean>>({});
+  const [completingJobId, setCompletingJobId] = useState<string | null>(null);
   const [recentJobs, setRecentJobs] = useState<CompletedSmsJob[]>([]);
   const [wakeLockActive, setWakeLockActive] = useState(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
   const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
-  const credsRef = useRef<StoredDeviceCredentials | null>(storedCreds);
+  const prevJobCountRef = useRef(0);
 
+  // Subscribe to Firestore device doc + queued SMS jobs + maintain 25s live heartbeat
   useEffect(() => {
-    credsRef.current = storedCreds;
-  }, [storedCreds]);
-
-  const closeSocket = useCallback(() => {
-    if (reconnectTimerRef.current !== null) {
-      window.clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
+    if (!authorized || !firebaseUser || !storedDevice) {
+      setSyncLive(false);
+      return;
     }
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch {
-        // Ignore close error
-      }
-      wsRef.current = null;
-    }
-  }, []);
 
-  const handleServerFrame = useCallback((rawData: string) => {
-    try {
-      const msg = JSON.parse(rawData) as {
-        type?: string;
-        deviceId?: string;
-        deviceToken?: string;
-        device?: LinkedMobileDevice;
-        simSlot?: SimSlotPreference;
-        jobId?: string;
-        to?: string;
-        message?: string;
-        error?: string;
-      };
+    const activeDeviceId = storedDevice.deviceId;
+    let disposed = false;
 
-      if (msg.type === 'device:paired' && msg.deviceToken && msg.device) {
-        const resolvedDeviceId = msg.deviceId || msg.device.id;
-        const nextCreds: StoredDeviceCredentials = {
-          deviceId: resolvedDeviceId,
-          deviceToken: msg.deviceToken,
-          device: msg.device,
-        };
-        saveStoredCredentials(nextCreds);
-        setStoredCreds(nextCreds);
-        setSocketState('online');
-        setError(null);
-        setNotice('Phone linked live to ZACMA Portal. Keep this tab open to send SMS via your SIM.');
-        reconnectAttemptRef.current = 0;
-        if (typeof window !== 'undefined') {
-          window.history.replaceState({}, '', `${window.location.pathname}?mode=phone-bridge`);
+    void heartbeatFirestoreDevice(activeDeviceId, true)
+      .then(() => {
+        if (!disposed) setSyncLive(true);
+      })
+      .catch(() => {
+        if (!disposed) setSyncLive(false);
+      });
+
+    const unsubDevice = subscribeFirestoreDeviceDoc(
+      activeDeviceId,
+      (updatedDevice) => {
+        if (!updatedDevice) {
+          saveStoredDevice(null);
+          setStoredDevice(null);
+          setPendingJobs([]);
+          setSyncLive(false);
+          setNotice('This phone was unlinked from the ZACMA dashboard.');
+          return;
         }
-        return;
-      }
-
-      if ((msg.type === 'device:ready' || msg.type === 'device:authed') && msg.device) {
-        setStoredCreds((prev) => {
+        setSyncLive(true);
+        setStoredDevice((prev) => {
           if (!prev) return prev;
-          const updated = { ...prev, device: msg.device! };
-          saveStoredCredentials(updated);
-          return updated;
+          const next = { deviceId: prev.deviceId, device: updatedDevice };
+          saveStoredDevice(next);
+          return next;
         });
-        setSocketState('online');
-        setError(null);
-        reconnectAttemptRef.current = 0;
-        return;
+      },
+      (err) => {
+        setSyncLive(false);
+        setError(err.message || 'Lost real-time sync with ZACMA.');
       }
+    );
 
-      if (msg.type === 'sim:update' && msg.simSlot) {
-        const updatedSlot = msg.simSlot;
-        setStoredCreds((prev) => {
-          if (!prev) return prev;
-          const updated = {
-            ...prev,
-            device: { ...prev.device, simSlot: updatedSlot },
-          };
-          saveStoredCredentials(updated);
-          return updated;
-        });
-        setNotice(`SIM routing switched to ${updatedSlot.toUpperCase()} from dashboard.`);
-        return;
-      }
-
-      if (msg.type === 'sms:dispatch' && msg.jobId && msg.to && typeof msg.message === 'string') {
-        const incoming: IncomingSmsJob = {
-          jobId: msg.jobId,
-          to: msg.to,
-          message: msg.message,
-          simSlot: msg.simSlot || 'auto',
-          receivedAt: new Date().toISOString(),
-        };
-        setPendingJobs((prev) => {
-          if (prev.some((j) => j.jobId === incoming.jobId)) return prev;
-          return [incoming, ...prev];
-        });
-        if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+    const unsubJobs = subscribeDeviceQueuedSmsJobs(
+      activeDeviceId,
+      (jobs) => {
+        setPendingJobs(jobs);
+        if (jobs.length > prevJobCountRef.current && typeof navigator !== 'undefined' && 'vibrate' in navigator) {
           try {
             navigator.vibrate(120);
           } catch {
             // Ignore vibration restrictions
           }
         }
-        return;
+        prevJobCountRef.current = jobs.length;
+      },
+      (err) => {
+        setError(err.message || 'Unable to listen for incoming SMS jobs.');
       }
+    );
 
-      if (msg.type === 'device:unlinked') {
-        saveStoredCredentials(null);
-        setStoredCreds(null);
-        setPendingJobs([]);
-        setSocketState('idle');
-        setNotice('This phone was unlinked from the ZACMA dashboard.');
-        return;
-      }
-
-      if (msg.type === 'pair:error') {
-        setError(msg.error || 'Pairing code expired or invalid. Regenerate a fresh QR on the dashboard.');
-        setSocketState('idle');
-        return;
-      }
-
-      if (msg.type === 'auth:error') {
-        saveStoredCredentials(null);
-        setStoredCreds(null);
-        setSocketState('idle');
-        setError(msg.error || 'Saved device session expired. Scan a fresh QR code to re-link.');
-      }
-    } catch {
-      // Ignore malformed socket frames
-    }
-  }, []);
-
-  // Maintain live WebSocket connection automatically when paired credentials exist
-  useEffect(() => {
-    if (!storedCreds) {
-      return;
-    }
-
-    // If a live socket is already open from the initial device:pair handshake, keep it
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      setSocketState('online');
-    }
-
-    let disposed = false;
-
-    const ensureConnected = () => {
-      if (disposed || !credsRef.current) return;
-      if (
-        wsRef.current &&
-        (wsRef.current.readyState === WebSocket.OPEN ||
-          wsRef.current.readyState === WebSocket.CONNECTING)
-      ) {
-        return;
-      }
-
-      setSocketState(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
-      const ws = new WebSocket(buildWebSocketUrl());
-      wsRef.current = ws;
-
-      ws.addEventListener('open', () => {
-        if (disposed || !credsRef.current) {
-          ws.close();
-          return;
-        }
-        ws.send(
-          JSON.stringify({
-            type: 'device:auth',
-            deviceId: credsRef.current.deviceId,
-            deviceToken: credsRef.current.deviceToken,
-          })
-        );
-      });
-
-      ws.addEventListener('message', (event) => {
-        handleServerFrame(String(event.data || '{}'));
-      });
-
-      ws.addEventListener('close', (event) => {
-        if (disposed || !credsRef.current) return;
-        if (event.code === 4003 || event.code === 4001) {
-          saveStoredCredentials(null);
-          setStoredCreds(null);
-          setPendingJobs([]);
-          setSocketState('idle');
-          setNotice('This phone was unlinked or its session expired. Scan a fresh QR code to re-link.');
-          return;
-        }
-        setSocketState('reconnecting');
-        const attempt = reconnectAttemptRef.current;
-        const delayMs = Math.min(12000, 1000 * Math.pow(2, attempt));
-        reconnectAttemptRef.current = Math.min(attempt + 1, 5);
-        reconnectTimerRef.current = window.setTimeout(() => {
-          ensureConnected();
-        }, delayMs);
-      });
-
-      ws.addEventListener('error', () => {
-        // Close listener handles reconnect
-      });
-    };
-
-    ensureConnected();
-
-    const pingTimer = window.setInterval(() => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'ping' }));
-      }
+    const heartbeatTimer = window.setInterval(() => {
+      void heartbeatFirestoreDevice(activeDeviceId, true).catch(() => {});
     }, 25000);
+
+    const handlePageHide = () => {
+      void heartbeatFirestoreDevice(activeDeviceId, false).catch(() => {});
+    };
+    window.addEventListener('pagehide', handlePageHide);
 
     return () => {
       disposed = true;
-      window.clearInterval(pingTimer);
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
+      unsubDevice();
+      unsubJobs();
+      window.clearInterval(heartbeatTimer);
+      window.removeEventListener('pagehide', handlePageHide);
     };
-  }, [storedCreds, handleServerFrame]);
+  }, [authorized, firebaseUser, storedDevice?.deviceId]);
 
-  // Clean up socket & wake lock on unmount
   useEffect(() => {
     return () => {
-      closeSocket();
       if (wakeLockRef.current) {
         void wakeLockRef.current.release();
         wakeLockRef.current = null;
       }
     };
-  }, [closeSocket]);
+  }, []);
 
-  const handlePairNow = (e: React.FormEvent) => {
+  const handleGoogleSignIn = async () => {
+    setSigningIn(true);
+    setError(null);
+    try {
+      await signInWithGoogle();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Google sign-in failed.');
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  const handlePairNow = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     setNotice(null);
@@ -441,98 +312,88 @@ export function MobileBridgeRunnerPage() {
     }
 
     const effectiveSim = parsed.simSlot || simSlot;
-    closeSocket();
-    setSocketState('pairing');
+    setPairingBusy(true);
 
-    const ws = new WebSocket(buildWebSocketUrl());
-    wsRef.current = ws;
+    try {
+      const { deviceId, device } = await completeFirestoreDevicePairing({
+        sessionId: parsed.pairingCode,
+        deviceName: deviceName.trim() || handset.deviceName,
+        androidVersion: handset.androidVersion,
+        phoneNumber: formattedPhone,
+        carrierName: carrierName.trim() || 'Ethio Telecom',
+        simSlot: effectiveSim,
+      });
 
-    ws.addEventListener('open', () => {
-      ws.send(
-        JSON.stringify({
-          type: 'device:pair',
-          pairingCode: parsed.pairingCode,
-          deviceName: deviceName.trim() || handset.deviceName,
-          androidVersion: handset.androidVersion,
-          phoneNumber: formattedPhone,
-          carrierName: carrierName.trim() || 'Ethio Telecom',
-          simSlot: effectiveSim,
-          dualSimSupported: true,
-          clientType: 'mobile-web',
-        })
-      );
-    });
-
-    ws.addEventListener('message', (event) => {
-      handleServerFrame(String(event.data || '{}'));
-    });
-
-    ws.addEventListener('close', () => {
-      if (!credsRef.current) {
-        setSocketState('idle');
+      const nextState: StoredDeviceState = { deviceId, device };
+      saveStoredDevice(nextState);
+      setStoredDevice(nextState);
+      setSyncLive(true);
+      setNotice('Phone linked live to ZACMA Portal. Keep this tab open to send SMS via your SIM.');
+      if (typeof window !== 'undefined') {
+        window.history.replaceState({}, '', `${window.location.pathname}?mode=phone-bridge`);
       }
-    });
-
-    ws.addEventListener('error', () => {
-      setError('Could not connect to ZACMA WebSocket bridge. Check your internet connection.');
-      setSocketState('idle');
-    });
-  };
-
-  const handleMarkSmsOpened = (jobId: string) => {
-    setPendingJobs((prev) =>
-      prev.map((j) => (j.jobId === jobId ? { ...j, openedInSmsApp: true } : j))
-    );
-  };
-
-  const handleReportJobResult = (job: IncomingSmsJob, status: 'sent' | 'failed') => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'sms:result',
-          jobId: job.jobId,
-          status,
-          ...(status === 'failed' ? { error: 'Marked failed on paired phone' } : {}),
-        })
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to link this phone. Generate a fresh QR code and try again.'
       );
-      if (status === 'sent') {
-        window.setTimeout(() => {
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(
-              JSON.stringify({
-                type: 'sms:dlr',
-                jobId: job.jobId,
-                status: 'delivered',
-              })
-            );
-          }
-        }, 400);
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+
+  const handleMarkSmsOpened = useCallback((jobId: string) => {
+    setOpenedJobIds((prev) => ({ ...prev, [jobId]: true }));
+  }, []);
+
+  const handleReportJobResult = async (job: FirestoreSmsJobItem, status: 'sent' | 'failed') => {
+    setCompletingJobId(job.jobId);
+    setError(null);
+    try {
+      const deviceLabel = storedDevice?.device.deviceName || 'Linked Phone';
+      const phoneLabel = storedDevice?.device.phoneNumber || 'SIM';
+      await completeFirestoreSmsJob(
+        job.jobId,
+        status === 'sent' ? 'delivered' : 'failed',
+        status === 'sent'
+          ? `Sent via ${deviceLabel} (${phoneLabel})`
+          : `Marked failed on ${deviceLabel}`
+      );
+      setPendingJobs((prev) => prev.filter((j) => j.jobId !== job.jobId));
+      setRecentJobs((prev) => [
+        {
+          jobId: job.jobId,
+          to: job.to,
+          message: job.message,
+          status,
+          completedAt: new Date().toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+          }),
+        },
+        ...prev.slice(0, 19),
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not report SMS status back to ZACMA.');
+    } finally {
+      setCompletingJobId(null);
+    }
+  };
+
+  const handleDisconnectLocally = async () => {
+    if (storedDevice) {
+      try {
+        await heartbeatFirestoreDevice(storedDevice.deviceId, false);
+      } catch {
+        // Non-fatal
       }
     }
-
-    setPendingJobs((prev) => prev.filter((j) => j.jobId !== job.jobId));
-    setRecentJobs((prev) => [
-      {
-        jobId: job.jobId,
-        to: job.to,
-        message: job.message,
-        status,
-        completedAt: new Date().toLocaleTimeString('en-US', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      },
-      ...prev.slice(0, 19),
-    ]);
-  };
-
-  const handleUnpairLocally = () => {
-    closeSocket();
-    saveStoredCredentials(null);
-    setStoredCreds(null);
+    saveStoredDevice(null);
+    setStoredDevice(null);
     setPendingJobs([]);
-    setSocketState('idle');
-    setNotice('Disconnected from this browser. You can re-pair with a fresh QR code anytime.');
+    setSyncLive(false);
+    setNotice('Disconnected from this phone. Scan a fresh QR code to link again anytime.');
   };
 
   const handleToggleWakeLock = async () => {
@@ -592,12 +453,12 @@ export function MobileBridgeRunnerPage() {
 
       <main className="flex-1 px-4 py-5 max-w-lg w-full mx-auto space-y-5">
         {/* Feedback banners */}
-        {error && (
+        {(error || authErrorMessage) && (
           <div
             role="alert"
             className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs font-medium text-red-700"
           >
-            {error}
+            {error || authErrorMessage}
           </div>
         )}
         {notice && !error && (
@@ -606,7 +467,48 @@ export function MobileBridgeRunnerPage() {
           </div>
         )}
 
-        {!storedCreds ? (
+        {authLoading ? (
+          <section className="bg-white border border-slate-200 rounded-2xl p-8 text-center space-y-3">
+            <RefreshCw className="w-5 h-5 text-blue-700 animate-spin mx-auto" />
+            <p className="text-sm font-semibold text-slate-900">Checking ZACMA authorization...</p>
+          </section>
+        ) : !authorized ? (
+          <section className="bg-white border border-slate-200 rounded-2xl p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0">
+                <Smartphone className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h1 className="font-display text-base font-bold text-slate-900">
+                  Sign In to Link This Phone
+                </h1>
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  Verify your ZACMA Google account on this phone so it can securely receive SMS
+                  dispatch jobs and sync delivery status in real time.
+                </p>
+              </div>
+            </div>
+
+            {initialQuery.pin && initialQuery.pair && (
+              <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                <span className="text-xs text-slate-600">Scanned QR Session PIN</span>
+                <span className="font-mono tabular-nums text-xs font-bold text-blue-700">
+                  {initialQuery.pin}
+                </span>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => void handleGoogleSignIn()}
+              disabled={signingIn}
+              className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-60"
+            >
+              <LogIn className="w-4 h-4" />
+              {signingIn ? 'Signing in...' : 'Sign in with Google'}
+            </button>
+          </section>
+        ) : !storedDevice ? (
           /* Pairing Form View */
           <section className="bg-white border border-slate-200 rounded-2xl p-5 space-y-5">
             <div className="flex items-start gap-3">
@@ -619,13 +521,13 @@ export function MobileBridgeRunnerPage() {
                 </h1>
                 <p className="text-xs text-slate-500 leading-relaxed">
                   {initialQuery.pair
-                    ? 'QR pairing code detected automatically. Confirm your SIM details below and tap Link This Phone.'
+                    ? 'QR pairing code detected automatically. Confirm your SIM details below and tap Link This Phone Now.'
                     : 'Scan the QR code from your ZACMA Dashboard with your phone camera, or paste the pairing link below.'}
                 </p>
               </div>
             </div>
 
-            <form onSubmit={handlePairNow} className="space-y-4">
+            <form onSubmit={(e) => void handlePairNow(e)} className="space-y-4">
               {initialQuery.pin && initialQuery.pair ? (
                 <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200">
                   <span className="text-xs text-slate-600">Detected QR Session PIN</span>
@@ -754,10 +656,10 @@ export function MobileBridgeRunnerPage() {
 
               <button
                 type="submit"
-                disabled={socketState === 'pairing'}
+                disabled={pairingBusy}
                 className="w-full min-h-[48px] px-4 py-3 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors cursor-pointer disabled:opacity-60"
               >
-                {socketState === 'pairing' ? (
+                {pairingBusy ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
                     Linking Phone...
@@ -780,34 +682,26 @@ export function MobileBridgeRunnerPage() {
                   <div className="flex items-center gap-2">
                     <span
                       className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                        socketState === 'online'
-                          ? 'bg-emerald-600'
-                          : socketState === 'reconnecting' || socketState === 'connecting'
-                            ? 'bg-amber-500'
-                            : 'bg-slate-400'
+                        syncLive ? 'bg-emerald-600' : 'bg-amber-500'
                       }`}
                       aria-hidden="true"
                     />
                     <h1 className="font-display text-base font-bold text-slate-900 truncate">
-                      {storedCreds.device.deviceName}
+                      {storedDevice.device.deviceName}
                     </h1>
                   </div>
                   <p className="text-xs text-slate-600 font-mono tabular-nums truncate">
-                    {storedCreds.device.phoneNumber} · {storedCreds.device.carrierName} ·{' '}
-                    {storedCreds.device.simSlot.toUpperCase()}
+                    {storedDevice.device.phoneNumber} · {storedDevice.device.carrierName} ·{' '}
+                    {storedDevice.device.simSlot.toUpperCase()}
                   </p>
                 </div>
 
                 <span
                   className={`text-xs font-semibold whitespace-nowrap ${
-                    socketState === 'online' ? 'text-emerald-700' : 'text-amber-700'
+                    syncLive ? 'text-emerald-700' : 'text-amber-700'
                   }`}
                 >
-                  {socketState === 'online'
-                    ? 'Live & Ready'
-                    : socketState === 'reconnecting'
-                      ? 'Reconnecting...'
-                      : 'Connecting...'}
+                  {syncLive ? 'Live & Ready' : 'Connecting...'}
                 </span>
               </div>
 
@@ -827,7 +721,7 @@ export function MobileBridgeRunnerPage() {
 
                 <button
                   type="button"
-                  onClick={handleUnpairLocally}
+                  onClick={() => void handleDisconnectLocally()}
                   className="min-h-[42px] px-3.5 py-2 rounded-xl border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <Power className="w-3.5 h-3.5" />
@@ -862,60 +756,66 @@ export function MobileBridgeRunnerPage() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {pendingJobs.map((job) => (
-                    <article
-                      key={job.jobId}
-                      className="bg-white border border-blue-200 rounded-2xl p-4 space-y-3.5"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="font-mono tabular-nums text-sm font-bold text-slate-900">
-                          {job.to}
-                        </p>
-                        <span className="text-[11px] font-mono uppercase text-blue-700 font-semibold">
-                          {job.simSlot === 'auto' ? 'Auto SIM' : job.simSlot}
-                        </span>
-                      </div>
-
-                      <p className="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-xl p-3 whitespace-pre-wrap break-words">
-                        {job.message}
-                      </p>
-
-                      <div className="space-y-2">
-                        <a
-                          href={buildSmsUri(job.to, job.message, handset.isIos)}
-                          onClick={() => handleMarkSmsOpened(job.jobId)}
-                          className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors"
-                        >
-                          <ExternalLink className="w-4 h-4" />
-                          1. Open in Phone SMS App
-                        </a>
-
-                        <div className="grid grid-cols-2 gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleReportJobResult(job, 'sent')}
-                            className={`min-h-[44px] px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
-                              job.openedInSmsApp
-                                ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
-                                : 'border border-emerald-300 text-emerald-700 hover:bg-emerald-50'
-                            }`}
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            2. Confirm Sent
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => handleReportJobResult(job, 'failed')}
-                            className="min-h-[44px] px-3 py-2 rounded-xl border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                            Mark Failed
-                          </button>
+                  {pendingJobs.map((job) => {
+                    const isOpened = Boolean(openedJobIds[job.jobId]);
+                    const isBusy = completingJobId === job.jobId;
+                    return (
+                      <article
+                        key={job.jobId}
+                        className="bg-white border border-blue-200 rounded-2xl p-4 space-y-3.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="font-mono tabular-nums text-sm font-bold text-slate-900">
+                            {job.to}
+                          </p>
+                          <span className="text-[11px] font-mono uppercase text-blue-700 font-semibold">
+                            {job.simSlot === 'auto' ? 'Auto SIM' : job.simSlot}
+                          </span>
                         </div>
-                      </div>
-                    </article>
-                  ))}
+
+                        <p className="text-sm text-slate-800 bg-slate-50 border border-slate-200 rounded-xl p-3 whitespace-pre-wrap break-words">
+                          {job.message}
+                        </p>
+
+                        <div className="space-y-2">
+                          <a
+                            href={buildSmsUri(job.to, job.message, handset.isIos)}
+                            onClick={() => handleMarkSmsOpened(job.jobId)}
+                            className="w-full min-h-[46px] px-4 py-2.5 rounded-xl bg-blue-700 hover:bg-blue-800 text-white text-sm font-semibold inline-flex items-center justify-center gap-2 transition-colors"
+                          >
+                            <ExternalLink className="w-4 h-4" />
+                            1. Open in Phone SMS App
+                          </a>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleReportJobResult(job, 'sent')}
+                              className={`min-h-[44px] px-3 py-2 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 ${
+                                isOpened
+                                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                  : 'border border-emerald-300 text-emerald-700 hover:bg-emerald-50'
+                              }`}
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              2. Confirm Sent
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleReportJobResult(job, 'failed')}
+                              className="min-h-[44px] px-3 py-2 rounded-xl border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                              Mark Failed
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
                 </div>
               )}
             </section>

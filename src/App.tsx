@@ -60,7 +60,9 @@ export default function App() {
   if (isPhoneBridgeRoute()) {
     return (
       <ErrorBoundary>
-        <MobileBridgeRunnerPage />
+        <AuthProvider>
+          <MobileBridgeRunnerPage />
+        </AuthProvider>
       </ErrorBoundary>
     );
   }

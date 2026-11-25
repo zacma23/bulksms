@@ -258,6 +258,78 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidMobilePairingSession(data) {
+      return data.keys().hasAll([
+          'shortPin', 'simSlot', 'status', 'expiresAtMs',
+          'orgId', 'createdBy', 'createdByEmail', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'shortPin', 'simSlot', 'status', 'expiresAtMs',
+          'orgId', 'createdBy', 'createdByEmail', 'createdAt', 'updatedAt'
+        ])
+        && data.shortPin is string && data.shortPin.size() >= 4 && data.shortPin.size() <= 24
+        && data.simSlot in ['auto', 'sim1', 'sim2']
+        && data.status in ['active', 'used', 'revoked']
+        && data.expiresAtMs is number && data.expiresAtMs > 0
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && isValidEmail(data.createdByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMobileDevice(data) {
+      return data.keys().hasAll([
+          'deviceName', 'androidVersion', 'phoneNumber', 'carrierName',
+          'simSlot', 'dualSimSupported', 'clientType', 'online', 'lastHeartbeatMs',
+          'orgId', 'linkedByUid', 'linkedByEmail', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'deviceName', 'androidVersion', 'phoneNumber', 'carrierName',
+          'simSlot', 'dualSimSupported', 'clientType', 'online', 'lastHeartbeatMs',
+          'orgId', 'linkedByUid', 'linkedByEmail', 'createdAt', 'updatedAt'
+        ])
+        && data.deviceName is string && data.deviceName.size() >= 1 && data.deviceName.size() <= 80
+        && data.androidVersion is string && data.androidVersion.size() >= 1 && data.androidVersion.size() <= 40
+        && data.phoneNumber is string && data.phoneNumber.size() >= 1 && data.phoneNumber.size() <= 32
+        && data.carrierName is string && data.carrierName.size() >= 1 && data.carrierName.size() <= 60
+        && data.simSlot in ['auto', 'sim1', 'sim2']
+        && data.dualSimSupported is bool
+        && data.clientType in ['android-native', 'mobile-web']
+        && data.online is bool
+        && data.lastHeartbeatMs is number && data.lastHeartbeatMs >= 0
+        && data.orgId == 'zacma'
+        && isValidId(data.linkedByUid)
+        && isValidEmail(data.linkedByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMobileSmsJob(data) {
+      return data.keys().hasAll([
+          'deviceId', 'recipientPhone', 'messageContent', 'simSlot',
+          'idempotencyKey', 'status', 'resultSummary',
+          'orgId', 'createdBy', 'createdByEmail', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'deviceId', 'recipientPhone', 'messageContent', 'simSlot',
+          'idempotencyKey', 'status', 'resultSummary',
+          'orgId', 'createdBy', 'createdByEmail', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.deviceId)
+        && isValidPhone(data.recipientPhone)
+        && data.messageContent is string && data.messageContent.size() >= 1 && data.messageContent.size() <= 1600
+        && data.simSlot in ['auto', 'sim1', 'sim2']
+        && data.idempotencyKey is string && data.idempotencyKey.size() >= 8 && data.idempotencyKey.size() <= 128
+        && data.status in ['queued', 'sent', 'delivered', 'failed', 'rejected']
+        && data.resultSummary is string && data.resultSummary.size() <= 500
+        && data.orgId == 'zacma'
+        && isValidId(data.createdBy)
+        && isValidEmail(data.createdByEmail)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     // =========================================================================
     // Collection Match Blocks
     // =========================================================================
@@ -478,6 +550,113 @@ service cloud.firestore {
         && isAuthorizedMember();
       allow update: if false;
       allow delete: if false;
+    }
+
+    // Mobile SIM Pairing Sessions (Single-use 10-minute QR sessions)
+    match /mobile_pairing_sessions/{sessionId} {
+      allow get: if isSignedIn() && isValidId(sessionId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(sessionId)
+        && isValidMobilePairingSession(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdByEmail == request.auth.token.email
+        && incoming().status == 'active'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAuthorizedMember();
+      allow update: if isSignedIn()
+        && isValidId(sessionId)
+        && isValidMobilePairingSession(incoming())
+        && incoming().shortPin == existing().shortPin
+        && incoming().simSlot == existing().simSlot
+        && incoming().expiresAtMs == existing().expiresAtMs
+        && incoming().orgId == existing().orgId
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdByEmail == existing().createdByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isAuthorizedMember()
+            && existing().status == 'active'
+            && incoming().status in ['used', 'revoked']
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(sessionId) && (isAdmin() || existing().createdBy == request.auth.uid);
+    }
+
+    // Linked Android SIM Devices
+    match /mobile_devices/{deviceId} {
+      allow get: if isSignedIn() && isValidId(deviceId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().linkedByUid == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(deviceId)
+        && isValidMobileDevice(incoming())
+        && incoming().linkedByUid == request.auth.uid
+        && incoming().linkedByEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isAuthorizedMember();
+      allow update: if isSignedIn()
+        && isValidId(deviceId)
+        && isValidMobileDevice(incoming())
+        && incoming().orgId == existing().orgId
+        && incoming().linkedByUid == existing().linkedByUid
+        && incoming().linkedByEmail == existing().linkedByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isAuthorizedMember()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'deviceName', 'androidVersion', 'phoneNumber', 'carrierName',
+              'simSlot', 'online', 'lastHeartbeatMs', 'updatedAt'
+            ])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(deviceId) && (isAdmin() || (isAuthorizedMember() && existing().linkedByUid == request.auth.uid));
+    }
+
+    // Real-Time Mobile SIM SMS Dispatch Jobs (enforces linked device existence)
+    match /mobile_sms_jobs/{jobId} {
+      allow get: if isSignedIn() && isValidId(jobId) && isAuthorizedMember();
+      allow list: if isSignedIn() && existing().orgId == 'zacma' && (isBootstrapAdmin() || existing().createdBy == request.auth.uid || isAuthorizedMember());
+      allow create: if isSignedIn()
+        && isValidId(jobId)
+        && isValidMobileSmsJob(incoming())
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdByEmail == request.auth.token.email
+        && incoming().status == 'queued'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && staffCanSendBulk()
+        && exists(/databases/$(database)/documents/mobile_devices/$(incoming().deviceId));
+      allow update: if isSignedIn()
+        && isValidId(jobId)
+        && isValidMobileSmsJob(incoming())
+        && incoming().deviceId == existing().deviceId
+        && incoming().recipientPhone == existing().recipientPhone
+        && incoming().messageContent == existing().messageContent
+        && incoming().simSlot == existing().simSlot
+        && incoming().idempotencyKey == existing().idempotencyKey
+        && incoming().orgId == existing().orgId
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdByEmail == existing().createdByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isAuthorizedMember()
+            && !(existing().status in ['delivered', 'failed', 'rejected'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'resultSummary', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(jobId) && isAdmin();
     }
 
     // Connection test document (read-only ping)

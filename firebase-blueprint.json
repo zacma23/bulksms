@@ -502,6 +502,230 @@
         }
       },
       "required": ["action", "actorUid", "actorEmail", "actorRole", "targetType", "targetId", "summary", "orgId", "createdAt"]
+    },
+    "MobilePairingSession": {
+      "title": "MobilePairingSession",
+      "description": "Single-use 10-minute QR code pairing session stored in Firestore for linking Android SIM devices across any host.",
+      "type": "object",
+      "properties": {
+        "shortPin": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 24
+        },
+        "simSlot": {
+          "type": "string",
+          "enum": ["auto", "sim1", "sim2"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "used", "revoked"]
+        },
+        "expiresAtMs": {
+          "type": "number"
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "shortPin",
+        "simSlot",
+        "status",
+        "expiresAtMs",
+        "orgId",
+        "createdBy",
+        "createdByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MobileDevice": {
+      "title": "MobileDevice",
+      "description": "Linked Android handset registered for direct SIM-based SMS sending with Dual SIM slot preference and live heartbeat.",
+      "type": "object",
+      "properties": {
+        "deviceName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "androidVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "phoneNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "carrierName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "simSlot": {
+          "type": "string",
+          "enum": ["auto", "sim1", "sim2"]
+        },
+        "dualSimSupported": {
+          "type": "boolean"
+        },
+        "clientType": {
+          "type": "string",
+          "enum": ["android-native", "mobile-web"]
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "lastHeartbeatMs": {
+          "type": "number"
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "linkedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "linkedByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "deviceName",
+        "androidVersion",
+        "phoneNumber",
+        "carrierName",
+        "simSlot",
+        "dualSimSupported",
+        "clientType",
+        "online",
+        "lastHeartbeatMs",
+        "orgId",
+        "linkedByUid",
+        "linkedByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MobileSmsJob": {
+      "title": "MobileSmsJob",
+      "description": "Real-time SIM SMS dispatch job queued from the ZACMA dashboard and executed by a linked Android handset.",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recipientPhone": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 20,
+          "pattern": "^\\+[1-9][0-9]{6,14}$"
+        },
+        "messageContent": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1600
+        },
+        "simSlot": {
+          "type": "string",
+          "enum": ["auto", "sim1", "sim2"]
+        },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "sent", "delivered", "failed", "rejected"]
+        },
+        "resultSummary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "orgId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByEmail": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "deviceId",
+        "recipientPhone",
+        "messageContent",
+        "simSlot",
+        "idempotencyKey",
+        "status",
+        "resultSummary",
+        "orgId",
+        "createdBy",
+        "createdByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -536,6 +760,18 @@
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
       "description": "Append-only audit trail of all SMS and administrative activities."
+    },
+    "/mobile_pairing_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/MobilePairingSession" },
+      "description": "Single-use 10-minute QR code pairing sessions for linking Android SIM devices."
+    },
+    "/mobile_devices/{deviceId}": {
+      "schema": { "$ref": "#/entities/MobileDevice" },
+      "description": "Linked Android handsets with Dual SIM routing and live online heartbeat."
+    },
+    "/mobile_sms_jobs/{jobId}": {
+      "schema": { "$ref": "#/entities/MobileSmsJob" },
+      "description": "Real-time SIM SMS dispatch queue synced between ZACMA dashboard and linked phones."
     }
   }
 }

@@ -22,6 +22,7 @@ import {
   sendMobileDeviceTestSms,
   updateLinkedDeviceSimSlot,
 } from '../lib/api';
+import { subscribeFirestoreMobileDevices } from '../lib/firestoreSimBridge';
 import { useAuth } from '../context/AuthContext';
 import { usePortalData } from '../context/PortalDataContext';
 import { isValidE164Phone, normalizePhoneNumber } from '../lib/smsUtils';
@@ -107,9 +108,7 @@ export function ConnectMobileDevice() {
   const [testFeedback, setTestFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
+  const prevDeviceCountRef = useRef<number>(0);
   const simSlotRef = useRef<SimSlotPreference>(simSlot);
 
   useEffect(() => {
@@ -165,127 +164,44 @@ export function ConnectMobileDevice() {
     void syncStatus(true);
   }, [authorized, firebaseUser, syncStatus]);
 
-  // Real-time Secure WebSocket bridge connection with auto-reconnect & idempotent reconciliation
+  // Real-time Firestore Cloud Sync for linked mobile devices (works on Vercel & AI Studio)
   useEffect(() => {
-    if (!authorized || !firebaseUser || typeof window === 'undefined') {
+    if (!authorized || !firebaseUser) {
       setSocketState('disconnected');
       return;
     }
 
-    let disposed = false;
-
-    const connectSocket = async () => {
-      if (disposed) return;
-      setSocketState(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
-
-      try {
-        const idToken = await firebaseUser.getIdToken();
-        if (disposed) return;
-
-        const wsUrl = buildWebSocketUrl(window.location.origin, '/ws/mobile-bridge');
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.addEventListener('open', () => {
-          if (disposed) {
-            ws.close();
-            return;
+    setSocketState('connecting');
+    const unsub = subscribeFirestoreMobileDevices(
+      (nextDevices) => {
+        setSocketState('connected');
+        setDevices(nextDevices);
+        if (nextDevices.length > prevDeviceCountRef.current && prevDeviceCountRef.current >= 0) {
+          // A new handset just finished pairing; refresh active session so a fresh QR is ready
+          if (prevDeviceCountRef.current > 0 || nextDevices.length > 0) {
+            void refreshSimBridgeStatus();
           }
-          ws.send(JSON.stringify({ type: 'auth:dashboard', idToken }));
-        });
-
-        ws.addEventListener('message', (event) => {
-          try {
-            const msg = JSON.parse(String(event.data || '{}')) as {
-              type?: string;
-              devices?: LinkedMobileDevice[];
-              device?: LinkedMobileDevice;
-              deviceId?: string;
-              online?: boolean;
-              lastSeenAt?: string;
-              error?: string;
-            };
-
-            if (msg.type === 'bridge:init') {
-              reconnectAttemptRef.current = 0;
-              setSocketState('connected');
-              if (Array.isArray(msg.devices)) {
-                setDevices(msg.devices);
-              }
-            } else if (msg.type === 'device:linked' && msg.device) {
-              setDevices((prev) => upsertDevice(prev, msg.device!));
-              // Previous QR pairing code was consumed — generate a fresh QR automatically if user wants to link another
-              void generateNewQr(simSlotRef.current);
-              void refreshSimBridgeStatus();
-            } else if (msg.type === 'device:updated' && msg.device) {
-              setDevices((prev) => upsertDevice(prev, msg.device!));
-              void refreshSimBridgeStatus();
-            } else if (msg.type === 'device:presence' && msg.deviceId) {
-              setDevices((prev) =>
-                prev.map((d) =>
-                  d.id === msg.deviceId
-                    ? {
-                        ...d,
-                        online: Boolean(msg.online),
-                        lastSeenAt: msg.lastSeenAt || d.lastSeenAt,
-                      }
-                    : d
-                )
-              );
-              void refreshSimBridgeStatus();
-            } else if (msg.type === 'device:unlinked' && msg.deviceId) {
-              setDevices((prev) => prev.filter((d) => d.id !== msg.deviceId));
-              void refreshSimBridgeStatus();
-            } else if (msg.type === 'auth:error' && msg.error) {
-              setError(msg.error);
-            }
-          } catch {
-            // Ignore malformed socket frames
-          }
-        });
-
-        ws.addEventListener('close', () => {
-          if (disposed) return;
-          setSocketState('reconnecting');
-          const attempt = reconnectAttemptRef.current;
-          const delayMs = Math.min(15000, 1000 * Math.pow(2, attempt));
-          reconnectAttemptRef.current = Math.min(attempt + 1, 5);
-          reconnectTimerRef.current = window.setTimeout(() => {
-            void connectSocket();
-          }, delayMs);
-        });
-
-        ws.addEventListener('error', () => {
-          // Close handler schedules exponential-backoff reconnect
-        });
-      } catch {
-        if (!disposed) {
-          setSocketState('disconnected');
         }
+        prevDeviceCountRef.current = nextDevices.length;
+      },
+      (err) => {
+        setSocketState('disconnected');
+        setError(err.message || 'Unable to connect to real-time device sync.');
       }
-    };
+    );
 
-    void connectSocket();
-
-    // Keep-alive ping every 30s
-    const pingTimer = window.setInterval(() => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'ping' }));
-      }
+    // Periodically re-check heartbeat freshness so stale handsets flip offline cleanly
+    const freshnessTimer = window.setInterval(() => {
+      void fetchMobileDeviceStatus()
+        .then((res) => setDevices(res.devices || []))
+        .catch(() => {});
     }, 30000);
 
     return () => {
-      disposed = true;
-      window.clearInterval(pingTimer);
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+      unsub();
+      window.clearInterval(freshnessTimer);
     };
-  }, [authorized, firebaseUser, generateNewQr, refreshSimBridgeStatus]);
+  }, [authorized, firebaseUser, refreshSimBridgeStatus]);
 
   // 1-second ticker for QR expiration countdown
   useEffect(() => {
@@ -591,9 +507,13 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
               </div>
             ) : (
               <div className="w-[188px] h-[188px] rounded-xl bg-white border border-slate-200 flex flex-col items-center justify-center p-4 space-y-3">
-                <p className="text-xs font-semibold text-slate-800">QR Code Expired</p>
+                <p className="text-xs font-semibold text-slate-800">
+                  {session ? 'QR Code Expired' : 'QR Code Unavailable'}
+                </p>
                 <p className="text-[11px] text-slate-500 leading-snug">
-                  Single-use pairing tokens expire after 10 minutes for device security.
+                  {session
+                    ? 'Single-use pairing tokens expire after 10 minutes for device security.'
+                    : error || 'Tap below to generate a fresh single-use pairing QR code.'}
                 </p>
                 <button
                   type="button"
@@ -701,12 +621,12 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
                 aria-hidden="true"
               />
               {socketState === 'connected'
-                ? 'Live WebSocket bridge connected'
+                ? 'Live Cloud Sync connected'
                 : socketState === 'reconnecting'
-                  ? 'Reconnecting WebSocket bridge...'
+                  ? 'Reconnecting Cloud Sync...'
                   : socketState === 'connecting'
-                    ? 'Connecting WebSocket bridge...'
-                    : 'Bridge offline'}
+                    ? 'Connecting Cloud Sync...'
+                    : 'Sync offline'}
             </span>
             <span aria-hidden="true">·</span>
             <span className="font-mono tabular-nums">
@@ -884,7 +804,7 @@ fun sendViaAndroidSmsManager(context: Context, to: String, body: String, slot: S
               Linked Android Devices ({devices.length})
             </h3>
             <span className="text-xs text-slate-500 font-mono tabular-nums">
-              {onlineCount} live via WebSocket
+              {onlineCount} live online
             </span>
           </div>
           <div className="divide-y divide-slate-100">

@@ -23,6 +23,7 @@ import {
   fetchSimBridgeStatus,
   normalizeDeliveryStatus,
 } from '../lib/api';
+import { subscribeFirestoreMobileDevices } from '../lib/firestoreSimBridge';
 import {
   analyzeSmsMessage,
   buildIdempotencyKey,
@@ -234,6 +235,22 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         )
       );
     }
+
+    unsubs.push(
+      subscribeFirestoreMobileDevices(
+        (devices) => {
+          const onlineDevicesCount = devices.filter((d) => d.online).length;
+          setSimBridgeStatus({
+            simBridgeReady: onlineDevicesCount > 0,
+            onlineDevicesCount,
+            linkedDevicesCount: devices.length,
+            devices,
+            wsEndpoint: '/ws/mobile-bridge',
+          });
+        },
+        (error) => handleFirestoreError(error, OperationType.LIST, 'mobile_devices')
+      )
+    );
 
     void refreshSimBridgeStatus();
 
