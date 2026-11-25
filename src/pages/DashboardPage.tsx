@@ -1,16 +1,4 @@
-import { useMemo, useState } from 'react';
-import {
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-} from 'recharts';
+import { useMemo } from 'react';
 import {
   RefreshCw,
   Send,
@@ -20,10 +8,9 @@ import {
 } from 'lucide-react';
 import { usePortalData } from '../context/PortalDataContext';
 import { ConnectMobileDevice } from '../components/ConnectMobileDevice';
+import { SmsAnalyticsWidget } from '../components/SmsAnalyticsWidget';
 import { formatTimestamp } from '../lib/smsUtils';
 import type { PortalTab } from '../types/portal';
-
-type ReportPeriod = 'daily' | 'weekly' | 'monthly';
 
 export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => void }) {
   const {
@@ -36,8 +23,6 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
     bridgeLoading,
     refreshSimBridgeStatus,
   } = usePortalData();
-
-  const [period, setPeriod] = useState<ReportPeriod>('daily');
 
   const stats = useMemo(() => {
     const totalSent = transactions.length;
@@ -71,110 +56,6 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
   const scrollToConnectDevice = () => {
     document.getElementById('connect-mobile-device')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
-
-  // 30-day SMS Sent vs. Failed trend data for the Recharts LineChart
-  const thirtyDayTrendData = useMemo(() => {
-    const now = new Date();
-    const days: { key: string; label: string; sent: number; failed: number }[] = [];
-
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(now.getDate() - i);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      days.push({ key, label, sent: 0, failed: 0 });
-    }
-
-    const dayMap = new Map(days.map((d) => [d.key, d]));
-
-    for (const tx of transactions) {
-      if (!tx.createdAt?.toDate) continue;
-      const d = tx.createdAt.toDate();
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-      const bucket = dayMap.get(key);
-      if (!bucket) continue;
-      if (tx.status === 'failed' || tx.status === 'rejected') {
-        bucket.failed += 1;
-      } else {
-        bucket.sent += 1;
-      }
-    }
-
-    return days;
-  }, [transactions]);
-
-  const thirtyDayTotals = useMemo(() => {
-    return thirtyDayTrendData.reduce(
-      (acc, d) => ({ sent: acc.sent + d.sent, failed: acc.failed + d.failed }),
-      { sent: 0, failed: 0 }
-    );
-  }, [thirtyDayTrendData]);
-
-  const chartData = useMemo(() => {
-    const now = new Date();
-    const buckets: { key: string; label: string; successful: number; failed: number; pending: number }[] = [];
-
-    if (period === 'daily') {
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(now.getDate() - i);
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        const label = d.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' });
-        buckets.push({ key, label, successful: 0, failed: 0, pending: 0 });
-      }
-      for (const tx of transactions) {
-        if (!tx.createdAt?.toDate) continue;
-        const d = tx.createdAt.toDate();
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        const b = buckets.find((x) => x.key === key);
-        if (!b) continue;
-        if (tx.status === 'delivered' || tx.status === 'sent') b.successful += 1;
-        else if (tx.status === 'failed' || tx.status === 'rejected') b.failed += 1;
-        else b.pending += 1;
-      }
-    } else if (period === 'weekly') {
-      for (let i = 5; i >= 0; i--) {
-        const start = new Date(now);
-        start.setDate(now.getDate() - i * 7 - 6);
-        const end = new Date(now);
-        end.setDate(now.getDate() - i * 7);
-        const label = `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
-        buckets.push({ key: `${start.getTime()}_${end.getTime()}`, label, successful: 0, failed: 0, pending: 0 });
-      }
-      for (const tx of transactions) {
-        if (!tx.createdAt?.toDate) continue;
-        const ms = tx.createdAt.toDate().getTime();
-        for (const b of buckets) {
-          const [s, e] = b.key.split('_').map(Number);
-          if (ms >= s && ms <= e + 86400000) {
-            if (tx.status === 'delivered' || tx.status === 'sent') b.successful += 1;
-            else if (tx.status === 'failed' || tx.status === 'rejected') b.failed += 1;
-            else b.pending += 1;
-            break;
-          }
-        }
-      }
-    } else {
-      for (let i = 5; i >= 0; i--) {
-        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-        const label = d.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
-        buckets.push({ key, label, successful: 0, failed: 0, pending: 0 });
-      }
-      for (const tx of transactions) {
-        if (!tx.createdAt?.toDate) continue;
-        const d = tx.createdAt.toDate();
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-        const b = buckets.find((x) => x.key === key);
-        if (!b) continue;
-        if (tx.status === 'delivered' || tx.status === 'sent') b.successful += 1;
-        else if (tx.status === 'failed' || tx.status === 'rejected') b.failed += 1;
-        else b.pending += 1;
-      }
-    }
-
-    return buckets;
-  }, [transactions, period]);
 
   const recentCampaigns = campaigns.slice(0, 6);
 
@@ -321,135 +202,12 @@ export function DashboardPage({ onNavigate }: { onNavigate: (tab: PortalTab) => 
       {/* Connect Mobile Device (Android SIM Bridge QR Pairing) */}
       <ConnectMobileDevice />
 
-      {/* 30-Day SMS Sent vs. Failed Line Chart */}
-      <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-          <div>
-            <h2 className="font-display text-base sm:text-lg font-bold text-slate-900">
-              SMS Sent vs. Failed — Last 30 Days
-            </h2>
-            <p className="text-xs text-slate-500">
-              Daily dispatch volume trend across all campaigns
-            </p>
-          </div>
-          <div className="flex items-center gap-3 text-xs font-mono tabular-nums text-slate-600">
-            <span className="text-blue-700 font-semibold">
-              {thirtyDayTotals.sent.toLocaleString()} sent
-            </span>
-            <span aria-hidden="true">·</span>
-            <span className="text-red-600 font-semibold">
-              {thirtyDayTotals.failed.toLocaleString()} failed
-            </span>
-          </div>
-        </div>
-
-        <div className="h-64 sm:h-72 w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={thirtyDayTrendData} margin={{ top: 8, right: 12, left: -16, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
-              <XAxis
-                dataKey="label"
-                interval={4}
-                tick={{ fontSize: 11, fill: '#64748B' }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                allowDecimals={false}
-                tick={{ fontSize: 12, fill: '#64748B' }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#0F172A',
-                  border: 'none',
-                  borderRadius: '12px',
-                  color: '#FFFFFF',
-                  fontSize: '12px',
-                }}
-              />
-              <Legend wrapperStyle={{ fontSize: '12px' }} />
-              <Line
-                type="monotone"
-                dataKey="sent"
-                name="SMS Sent"
-                stroke="#1D4ED8"
-                strokeWidth={2.5}
-                dot={{ r: 2.5, fill: '#1D4ED8' }}
-                activeDot={{ r: 5 }}
-              />
-              <Line
-                type="monotone"
-                dataKey="failed"
-                name="SMS Failed"
-                stroke="#DC2626"
-                strokeWidth={2.5}
-                dot={{ r: 2.5, fill: '#DC2626' }}
-                activeDot={{ r: 5 }}
-              />
-            </LineChart>
-          </ResponsiveContainer>
-        </div>
-      </section>
-
-      {/* Usage Chart & Reports (Daily / Weekly / Monthly Breakdown) */}
-      <section className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 space-y-5">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div>
-            <h2 className="font-display text-base sm:text-lg font-bold text-slate-900">
-              SMS Usage & Delivery Statistics
-            </h2>
-            <p className="text-xs text-slate-500">
-              {period === 'daily'
-                ? 'Last 7 days transaction breakdown'
-                : period === 'weekly'
-                  ? 'Last 6 weeks transaction breakdown'
-                  : 'Last 6 months transaction breakdown'}
-            </p>
-          </div>
-
-          <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-xl self-start">
-            {(['daily', 'weekly', 'monthly'] as ReportPeriod[]).map((p) => (
-              <button
-                key={p}
-                type="button"
-                onClick={() => setPeriod(p)}
-                className={`min-h-[36px] px-3.5 py-1.5 rounded-lg text-xs font-semibold capitalize transition-colors cursor-pointer whitespace-nowrap ${
-                  period === p
-                    ? 'bg-white text-blue-700 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="h-64 sm:h-72 w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
-              <XAxis dataKey="label" tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
-              <YAxis allowDecimals={false} tick={{ fontSize: 12, fill: '#64748B' }} axisLine={false} tickLine={false} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#0F172A',
-                  border: 'none',
-                  borderRadius: '12px',
-                  color: '#FFFFFF',
-                  fontSize: '12px',
-                }}
-              />
-              <Legend wrapperStyle={{ fontSize: '12px' }} />
-              <Bar dataKey="successful" name="Sent / Delivered" fill="#1D4ED8" radius={[6, 6, 0, 0]} maxBarSize={36} />
-              <Bar dataKey="failed" name="Failed" fill="#DC2626" radius={[6, 6, 0, 0]} maxBarSize={36} />
-              <Bar dataKey="pending" name="Pending" fill="#94A3B8" radius={[6, 6, 0, 0]} maxBarSize={36} />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </section>
+      {/* SMS Delivery Success Rates, Failure Reasons & Daily Volume (Recharts) */}
+      <SmsAnalyticsWidget
+        transactions={transactions}
+        loading={dataLoading}
+        onNavigate={onNavigate}
+      />
 
       {/* Recent SMS Campaigns */}
       <section className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
